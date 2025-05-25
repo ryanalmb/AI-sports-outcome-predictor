@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: sports-prediction-bot
+    env: python
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: python fixed_bot.py
+    plan: free
+    autoDeploy: false
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: FOOTBALL_API_KEY
+        sync: false
+      - key: ODDS_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sports-prediction-db
+          property: connectionString
+    
+databases:
+  - name: sports-prediction-db
+    databaseName: sports_predictions
+    user: sports_user
+    plan: free
