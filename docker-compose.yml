@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: sports_prediction
+      POSTGRES_USER: sports_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sports_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sports_user -d sports_prediction"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Sports Prediction Bot Platform
+  sports-bot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database Configuration
+      DATABASE_URL: postgresql://sports_user:${POSTGRES_PASSWORD:-sports_pass}@postgres:5432/sports_prediction
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: sports_user
+      PGPASSWORD: ${POSTGRES_PASSWORD:-sports_pass}
+      PGDATABASE: sports_prediction
+      
+      # API Keys (to be provided)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      FOOTBALL_API_KEY: ${FOOTBALL_API_KEY}
+      ODDS_API_KEY: ${ODDS_API_KEY}
+      
+      # Application Configuration
+      NODE_ENV: production
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "5000:5000"  # Mini App
+      - "8080:8080"  # Health Check
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    driver: bridge
