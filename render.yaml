@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: sports-prediction-bot
     env: python
     buildCommand: pip install uv && uv sync --frozen
