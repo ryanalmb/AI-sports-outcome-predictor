@@ -42,9 +42,9 @@ services:
       # Application Configuration
       NODE_ENV: production
       PYTHONUNBUFFERED: 1
+      PORT: ${PORT:-8080}
     ports:
-      - "5000:5000"  # Mini App
-      - "8080:8080"  # Health Check
+      - "${PORT:-8080}:${PORT:-8080}"  # Dynamic port for deployment flexibility
     volumes:
       - ./logs:/app/logs
     restart: unless-stopped
