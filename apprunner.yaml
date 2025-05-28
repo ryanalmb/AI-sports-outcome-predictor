@@ -1,8 +1,6 @@
 version: 1.0
 runtime: python3
 build:
-  commands:
-    - pip install --no-cache-dir uv
-    - uv sync --frozen
+  commands: pip install --no-cache-dir uv && uv sync --frozen
 run:
   command: python main.py
