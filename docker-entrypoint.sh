@@ -30,4 +30,4 @@ asyncio.run(setup())
 
 # Start the main application
 echo "🤖 Starting Sports Prediction Bot..."
-exec python fixed_bot.py
+exec python -m telegram_bot.bot
