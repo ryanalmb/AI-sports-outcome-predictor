@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sports Prediction Community</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--tg-theme-bg-color, #ffffff);
+            color: var(--tg-theme-text-color, #000000);
+            padding: 16px;
+            min-height: 100vh;
+        }
+        
+        .header {
+            text-align: center;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--tg-theme-hint-color, #e0e0e0);
+            margin-bottom: 20px;
+        }
+        
+        .header h1 {
+            color: var(--tg-theme-button-color, #0088cc);
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        
+        .header p {
+            color: var(--tg-theme-hint-color, #999999);
+            font-size: 14px;
+        }
+        
+        .tabs {
+            display: flex;
+            background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+            border-radius: 12px;
+            padding: 4px;
+            margin-bottom: 20px;
+        }
+        
+        .tab {
+            flex: 1;
+            padding: 12px;
+            text-align: center;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        
+        .tab.active {
+            background: var(--tg-theme-button-color, #0088cc);
+            color: var(--tg-theme-button-text-color, #ffffff);
+        }
+        
+        .content {
+            display: none;
+        }
+        
+        .content.active {
+            display: block;
+        }
+        
+        .card {
+            background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-card {
+            background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+        }
+        
+        .stat-number {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--tg-theme-button-color, #0088cc);
+            margin-bottom: 4px;
+        }
+        
+        .stat-label {
+            font-size: 12px;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+        
+        .leaderboard-item {
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        
+        .rank {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: var(--tg-theme-button-color, #0088cc);
+            color: var(--tg-theme-button-text-color, #ffffff);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            margin-right: 12px;
+        }
+        
+        .user-info {
+            flex: 1;
+        }
+        
+        .username {
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+        
+        .user-stats {
+            font-size: 12px;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+        
+        .accuracy {
+            font-weight: bold;
+            color: var(--tg-theme-button-color, #0088cc);
+        }
+        
+        .feed-item {
+            background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        
+        .match {
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        
+        .prediction {
+            color: var(--tg-theme-button-color, #0088cc);
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+        
+        .meta {
+            font-size: 12px;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+        
+        .badges {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        
+        .badge {
+            background: var(--tg-theme-button-color, #0088cc);
+            color: var(--tg-theme-button-text-color, #ffffff);
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--tg-theme-hint-color, #999999);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏆 Community Hub</h1>
+        <p>Sports Prediction Community</p>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
+        <div class="tab" onclick="showTab('leaderboard')">Leaderboard</div>
+        <div class="tab" onclick="showTab('feed')">Feed</div>
+    </div>
+    
+    <div id="dashboard" class="content active">
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-number" id="user-predictions">15</div>
+                <div class="stat-label">Predictions</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="user-accuracy">73%</div>
+                <div class="stat-label">Accuracy</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="user-streak">2</div>
+                <div class="stat-label">Current Streak</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="user-rank">Skilled</div>
+                <div class="stat-label">Rank</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h3 style="margin-bottom: 12px;">🏅 Your Badges</h3>
+            <div class="badges">
+                <div class="badge">🎯 First Prediction</div>
+                <div class="badge">🔥 Hot Streak</div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="leaderboard" class="content">
+        <div id="leaderboard-content">
+            <div class="leaderboard-item">
+                <div class="rank">1</div>
+                <div class="user-info">
+                    <div class="username">Champion Predictor</div>
+                    <div class="user-stats">45 predictions • <span class="accuracy">80.0%</span></div>
+                </div>
+            </div>
+            <div class="leaderboard-item">
+                <div class="rank">2</div>
+                <div class="user-info">
+                    <div class="username">Pro Analyst</div>
+                    <div class="user-stats">38 predictions • <span class="accuracy">73.7%</span></div>
+                </div>
+            </div>
+            <div class="leaderboard-item">
+                <div class="rank">3</div>
+                <div class="user-info">
+                    <div class="username">Market Expert</div>
+                    <div class="user-stats">32 predictions • <span class="accuracy">68.8%</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="feed" class="content">
+        <div id="feed-content">
+            <div class="feed-item">
+                <div class="match">⚽ Manchester City vs Liverpool</div>
+                <div class="prediction">Prediction: Manchester City Win (68.5% confidence)</div>
+                <div class="meta">by Football Expert • Premier League • Market-backed</div>
+            </div>
+            <div class="feed-item">
+                <div class="match">⚽ Barcelona vs Real Madrid</div>
+                <div class="prediction">Prediction: Draw (45.2% confidence)</div>
+                <div class="meta">by La Liga Specialist • La Liga • Market-backed</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Telegram Web App
+        window.Telegram.WebApp.ready();
+        window.Telegram.WebApp.expand();
+        
+        function showTab(tabName) {
+            // Hide all content
+            document.querySelectorAll('.content').forEach(content => {
+                content.classList.remove('active');
+            });
+            
+            // Remove active class from all tabs
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked tab
+            event.target.classList.add('active');
+            
+            // Haptic feedback
+            if (window.Telegram.WebApp.HapticFeedback) {
+                window.Telegram.WebApp.HapticFeedback.impactOccurred('light');
+            }
+        }
+        
+        // Load user data from API
+        async function loadUserData() {
+            try {
+                const telegramUser = window.Telegram.WebApp.initDataUnsafe?.user;
+                const userId = telegramUser?.id || '123456789';
+                
+                const response = await fetch(`/api/user/${userId}`);
+                const userData = await response.json();
+                
+                // Update dashboard
+                document.getElementById('user-predictions').textContent = userData.totalPredictions;
+                document.getElementById('user-accuracy').textContent = userData.accuracy.toFixed(1) + '%';
+                document.getElementById('user-streak').textContent = userData.currentStreak;
+                document.getElementById('user-rank').textContent = userData.rank.split(' ')[0];
+                
+            } catch (error) {
+                console.log('Using default data');
+            }
+        }
+        
+        // Load data when app starts
+        loadUserData();
+        
+        // Set theme colors
+        document.documentElement.style.setProperty('--tg-theme-bg-color', window.Telegram.WebApp.backgroundColor || '#ffffff');
+        document.documentElement.style.setProperty('--tg-theme-text-color', window.Telegram.WebApp.textColor || '#000000');
+    </script>
+</body>
+</html>

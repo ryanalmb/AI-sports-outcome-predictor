@@ -1,62 +1,26 @@
-# Deploy Sports Prediction Bot to Render.com
+# Deploy Sports Prediction Bot
 
-## Quick Deploy Steps
+This project is now local-first and LLM-first (Gemini), with no DB and no heavy ML by default.
 
-1. **Connect GitHub Repository**
-   - Go to [Render.com](https://render.com)
-   - Click "New" → "Web Service"
-   - Connect your GitHub repository: `ryanalmb/AI-sports-outcome-predictor`
+## Render.com (simple)
+- Build Command: `pip install uv && uv sync --frozen`
+- Start Command: `python fixed_bot.py`
+- Environment Variables:
+  - TELEGRAM_BOT_TOKEN (required)
+  - FOOTBALL_API_KEY (optional; for upcoming fixtures via football-data.org)
+  - GEMINI_API_KEY (optional; to enable LLM-first predictions)
+  - GEMINI_MODEL_ID (optional; default: gemini-2.5-pro)
+- Port: The bot runs a health endpoint on `$PORT` (defaults to 10000 locally).
 
-2. **Configure Service Settings**
-   ```
-   Name: sports-prediction-bot
-   Environment: Python 3
-   Build Command: pip install uv && uv sync --frozen
-   Start Command: python fixed_bot.py
-   ```
+## Docker (optional)
+A minimal Dockerfile is provided. Example:
 
-3. **Set Environment Variables**
-   Add these required variables in Render dashboard:
-   ```
-   TELEGRAM_BOT_TOKEN=your_bot_token_here
-   FOOTBALL_API_KEY=your_football_api_key
-   ODDS_API_KEY=your_odds_api_key
-   ```
+```
+docker build -t sports-bot .
+docker run -e TELEGRAM_BOT_TOKEN=xxxx -e FOOTBALL_API_KEY=xxxx -p 8080:8080 sports-bot
+```
 
-4. **Database Setup (Optional)**
-   - Create PostgreSQL database in Render
-   - Add DATABASE_URL environment variable
-   - Your bot will automatically create tables
-
-## Features Ready for Deployment
-
-✅ **Enhanced 27-Feature Prediction System**
-- Professional-grade sports analysis
-- Multiple ML frameworks (XGBoost, LightGBM, TensorFlow, PyTorch)
-- Authentic match data from comprehensive dataset
-
-✅ **Production Ready**
-- Flexible PORT binding for Render.com
-- Health check endpoints
-- Error handling and logging
-- Docker deployment support
-
-✅ **Complete Bot Functionality**
-- Real-time match predictions
-- Live betting odds integration
-- Community features and leaderboards
-- Professional prediction accuracy
-
-## Your Bot Capabilities
-
-🎯 **Prediction Tiers Available:**
-- Standard predictions (`/predict`)
-- Enhanced analysis (`/analysis`) 
-- Professional predictions (`/advanced`)
-- Neural network predictions (`/deepml`)
-- Ultimate God Ensemble predictions
-
-🏆 **League Coverage:**
-Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Champions League, MLS, Liga MX, Eredivisie
-
-Your sophisticated prediction platform is ready to deliver intelligent sports analysis using authentic data!
+Notes:
+- Database is not used in the default path. Community features are disabled.
+- Heavy ML frameworks (xgboost, lightgbm, tensorflow, pytorch) are archived and not installed.
+- `/predict` uses the LLM if `USE_LLM=1` and `GEMINI_API_KEY` is set; otherwise a heuristic fallback is used.

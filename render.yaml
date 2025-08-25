@@ -13,13 +13,7 @@ services:
         sync: false
       - key: ODDS_API_KEY
         sync: false
-      - key: DATABASE_URL
-        fromDatabase:
-          name: sports-prediction-db
-          property: connectionString
-    
-databases:
-  - name: sports-prediction-db
-    databaseName: sports_predictions
-    user: sports_user
-    plan: free
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL_ID
+        value: gemini-2.5-pro
