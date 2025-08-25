@@ -12,7 +12,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, RetryAfter, NetworkError
 
-from simple_football_api import SimpleFootballAPI
+from simple_football_api import SimpleFootballAPI  # legacy for other features
+from providers.thesportsdb_provider import TheSportsDbProvider
 from enhanced_predictions import EnhancedPredictionEngine
 # from advanced_prediction_engine import AdvancedPredictionEngine  # Disabled: LLM-only mode
 from llm_predictor import GeminiPredictor
@@ -48,6 +49,9 @@ class SimpleSportsBot:
         # External services (persistent)
         self.sports_collector = SimpleFootballAPI()
         self._api_ready = False
+        # New provider for leagues and upcoming fixtures (TheSportsDB)
+        self.provider = TheSportsDbProvider(os.getenv('THESPORTSDB_API_KEY'))
+        self._provider_ready = False
         self.enhanced_predictor = EnhancedPredictionEngine()
         self.advanced_predictor = None  # Disabled: LLM-only mode
         self.llm = GeminiPredictor()
@@ -62,6 +66,16 @@ class SimpleSportsBot:
                 logger.error(f"Failed to initialize SimpleFootballAPI: {e}")
                 raise
 
+    async def ensure_provider(self):
+        if not self._provider_ready:
+            try:
+                await self.provider.initialize()
+                self._provider_ready = True
+                logger.info("TheSportsDB provider initialized (persistent)")
+            except Exception as e:
+                logger.error(f"Failed to initialize TheSportsDB provider: {e}")
+                raise
+
     async def shutdown(self):
         try:
             if self._api_ready:
@@ -69,6 +83,12 @@ class SimpleSportsBot:
                 logger.info("Simple Football API closed (shutdown)")
         except Exception as e:
             logger.warning(f"Error closing SimpleFootballAPI: {e}")
+        try:
+            if self._provider_ready:
+                await self.provider.close()
+                logger.info("TheSportsDB provider closed (shutdown)")
+        except Exception as e:
+            logger.warning(f"Error closing TheSportsDB provider: {e}")
         # Close predictors if they hold network resources
         try:
             await self.enhanced_predictor.close()
@@ -141,27 +161,35 @@ class SimpleSportsBot:
         await update.message.reply_text(help_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def leagues_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        leagues_text = (
-            "🏆 *Supported Football Leagues*\n\n"
-            "🇬🇧 **Premier League**\n🇪🇸 **La Liga**\n🇮🇹 **Serie A**\n🇩🇪 **Bundesliga**\n🇫🇷 **Ligue 1**\n\n"
-            "🏆 **Champions League**\n🇺🇸 **MLS**\n🇲🇽 **Liga MX**\n🇳🇱 **Eredivisie**\n\n"
-            "Real-time match data and predictions available! ⚡"
-        )
-        keyboard = [[InlineKeyboardButton("📅 Upcoming Matches", callback_data="upcoming"), InlineKeyboardButton("🎯 Get Predictions", callback_data="predict")]]
-        await update.message.reply_text(leagues_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        """Slash command variant: replies in chat context."""
+        try:
+            await self.ensure_provider()
+            leagues = await self.provider.list_leagues()
+            text, keyboard = self._format_leagues_text_and_keyboard(leagues)
+            if update.message:
+                await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+            elif update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+            else:
+                logger.warning("/leagues called without message or callback_query context")
+        except Exception as e:
+            logger.error(f"Error in /leagues: {e}")
+            if update.message:
+                await update.message.reply_text("⚠️ Error fetching leagues.")
 
     async def upcoming_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("⏳ Getting live upcoming matches...")
+        await update.message.reply_text("⏳ Getting upcoming matches...")
         try:
-            await self.sports_collector.initialize()
-            real_matches = await self.sports_collector.get_real_upcoming_matches()
-            if real_matches:
-                txt = "📅 *Live Upcoming Matches*\n\n⚽ *Football Matches from Multiple Leagues*\n"
-                for match in real_matches[:9]:
-                    match_time = match.get('match_time', match.get('time', 'TBD'))
-                    txt += f"  • {match.get('home_team','TBD')} vs {match.get('away_team','TBD')}\n"
-                    txt += f"    🏆 {match.get('league','League')} • ⏰ {match_time}\n\n"
-                txt += f"\n*Total: {len(real_matches)} matches found*\nData from football-data.org ✅"
+            await self.ensure_provider()
+            matches = await self.provider.get_upcoming_matches(max_total=10)
+            if matches:
+                txt = "📅 *Upcoming Matches*\n\n⚽ *Football Matches from Multiple Leagues*\n"
+                for m in matches[:9]:
+                    match_time = m.match_time or 'TBD'
+                    league = m.league_name or 'League'
+                    txt += f"  • {m.home_team} vs {m.away_team}\n"
+                    txt += f"    🏆 {league} • ⏰ {match_time}\n\n"
+                txt += f"\n*Total: {len(matches)} matches found*\nData from TheSportsDB ✅"
             else:
                 txt = (
                     "📅 *Upcoming Matches*\n\n"
@@ -172,8 +200,6 @@ class SimpleSportsBot:
         except Exception as e:
             logger.error(f"Error in /upcoming: {e}")
             await update.message.reply_text("⚠️ Error getting upcoming matches.")
-        finally:
-            await self.sports_collector.close()
 
     async def predict_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -265,22 +291,13 @@ class SimpleSportsBot:
             await update.message.reply_text("⚠️ Error generating analysis.")
 
     async def live_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await update.message.reply_text("🔴 Getting live match updates...")
-            await self.enhanced_predictor.initialize()
-            live_matches = await self.enhanced_predictor.get_live_match_updates()
-            if live_matches:
-                live_text = "🔴 *Live Matches*\n\n"
-                for match in live_matches[:5]:
-                    live_text += f"**{match['home_team']} {match['home_score']}-{match['away_score']} {match['away_team']}**\n"
-                    live_text += f"⏱️ {match['minute']}'\n\n"
-            else:
-                live_text = "🔴 *Live Matches*\n\n⚠️ No live matches currently. Check back during match times!"
-            await update.message.reply_text(live_text, parse_mode='Markdown')
-            await self.enhanced_predictor.close()
-        except Exception as e:
-            logger.error(f"Error in /live: {e}")
-            await update.message.reply_text("⚠️ Error getting live updates.")
+        # Disabled to preserve free-tier rate limits and avoid live polling
+        msg = (
+            "🔴 *Live updates are disabled for now*\n\n"
+            "Free API tiers typically do not support reliable live data and can burn through rate limits.\n"
+            "We will enable `/live` once a suitable plan is configured."
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown')
 
     async def accuracy_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -374,7 +391,7 @@ class SimpleSportsBot:
         data = query.data
         try:
             if data == "leagues":
-                await self.leagues_command(update, context)
+                await self.send_leagues_response(query)
             elif data == "upcoming":
                 await self.send_upcoming_response(query)
             elif data == "predict":
@@ -402,25 +419,24 @@ class SimpleSportsBot:
             await query.edit_message_text("⚠️ Error handling action. Please try again.")
 
     async def send_upcoming_response(self, query):
-        await query.edit_message_text("⏳ Getting live upcoming matches...")
+        await query.edit_message_text("⏳ Getting upcoming matches...")
         try:
-            await self.sports_collector.initialize()
-            real_matches = await self.sports_collector.get_real_upcoming_matches()
-            if real_matches:
-                txt = "📅 *Live Upcoming Matches*\n\n⚽ *Football Matches from Multiple Leagues*\n"
-                for match in real_matches[:9]:
-                    match_time = match.get('match_time', match.get('time', 'TBD'))
-                    txt += f"  • {match.get('home_team','TBD')} vs {match.get('away_team','TBD')}\n"
-                    txt += f"    🏆 {match.get('league','League')} • ⏰ {match_time}\n\n"
-                txt += f"\n*Total: {len(real_matches)} matches found*\nData from football-data.org ✅"
+            await self.ensure_provider()
+            matches = await self.provider.get_upcoming_matches(max_total=10)
+            if matches:
+                txt = "📅 *Upcoming Matches*\n\n⚽ *Football Matches from Multiple Leagues*\n"
+                for m in matches[:9]:
+                    match_time = m.match_time or 'TBD'
+                    league = m.league_name or 'League'
+                    txt += f"  • {m.home_team} vs {m.away_team}\n"
+                    txt += f"    🏆 {league} • ⏰ {match_time}\n\n"
+                txt += f"\n*Total: {len(matches)} matches found*\nData from TheSportsDB ✅"
             else:
                 txt = "📅 *Upcoming Matches*\n\n⚠️ No upcoming matches found at the moment."
             keyboard = [[InlineKeyboardButton("🎯 Get Predictions", callback_data="predict"), InlineKeyboardButton("🔄 Refresh", callback_data="upcoming")]]
             await query.edit_message_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception:
             await query.edit_message_text("⚠️ Error getting matches.")
-        finally:
-            await self.sports_collector.close()
 
     async def send_predict_response(self, query):
         await query.edit_message_text("🎯 Generating predictions...")
@@ -495,8 +511,9 @@ class SimpleSportsBot:
 
     async def send_live_response(self, query):
         response_text = (
-            "🔴 *Live Match Updates*\n\n"
-            "Use `/live` to get real-time match information.\n"
+            "🔴 *Live updates are disabled for now*\n\n"
+            "Free API tiers typically do not support reliable live data and can burn through rate limits.\n"
+            "We will enable `/live` once a suitable plan is configured."
         )
         await query.edit_message_text(response_text, parse_mode='Markdown')
 
