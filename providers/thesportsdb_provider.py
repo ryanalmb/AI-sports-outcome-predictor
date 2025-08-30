@@ -56,9 +56,9 @@ class TheSportsDbProvider:
         # caches
         self._leagues_cache: Tuple[float, List[League]] = (0.0, [])
         self._upcoming_cache: Tuple[float, List[Match]] = (0.0, [])
-        # TTLs
-        self._leagues_ttl = 24 * 3600
-        self._upcoming_ttl = 180
+        # TTLs - Extended for better performance with 30 req/min limit
+        self._leagues_ttl = 24 * 3600  # 24 hours
+        self._upcoming_ttl = 600  # 10 minutes as requested
 
     async def initialize(self) -> None:
         if not self.session or self.session.closed:
@@ -102,35 +102,64 @@ class TheSportsDbProvider:
             return []
 
     async def get_upcoming_matches(self, max_total: int = 10) -> List[Match]:
-        """Fetch upcoming matches from a small set of core leagues.
-        Uses eventsnextleague.php for the preferred soccer leagues.
-        Results cached briefly to conserve rate limits.
+        """Fetch upcoming matches with 10-minute cache optimization.
+        Uses eventsnextleague.php for preferred soccer leagues with intelligent rate limiting.
+        Results cached for 10 minutes to optimize the 30 requests/minute free tier limit.
         """
         now = asyncio.get_running_loop().time()
         ts, cached = self._upcoming_cache
         if cached and (now - ts) < self._upcoming_ttl:
+            logger.info(f"Using 10-minute cache, {len(cached)} matches available")
             return cached
+        
         leagues = await self.list_leagues()
-        # Choose up to 6 preferred leagues
-        selected = [lg for lg in leagues if lg.name in PREFERRED_SOCCER_LEAGUES][:6]
-        # If not found (free key might have smaller coverage), just pick first soccer leagues
-        if not selected:
-            selected = leagues[:6]
+        # Expand to include more sports as requested: NFL, MLS, NHL, NBA, etc.
+        enhanced_preferred = PREFERRED_SOCCER_LEAGUES.union({
+            "National Football League", "NFL", 
+            "Major League Soccer", "MLS",
+            "National Hockey League", "NHL",
+            "National Basketball Association", "NBA",
+            "Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1"
+        })
+        
+        # Select up to 8 leagues for comprehensive coverage
+        selected = [lg for lg in leagues if any(pref in lg.name for pref in enhanced_preferred)][:8]
+        # If not enough preferred leagues found, add popular ones
+        if len(selected) < 6:
+            additional = [lg for lg in leagues if lg not in selected][:6-len(selected)]
+            selected.extend(additional)
+        
         matches: List[Match] = []
+        request_count = 0
+        
+        logger.info(f"Fetching matches from {len(selected)} leagues with 10-min cache")
+        
         for lg in selected:
             if not lg.id:
                 continue
+            
+            # Conservative rate limiting for 30 req/min (allow some buffer)
+            if request_count >= 10:  # Use max 1/3 of rate limit
+                logger.info(f"Rate limit protection: stopping at {request_count} requests")
+                break
+                
             url = f"{self.base}/eventsnextleague.php?id={lg.id}"
             try:
                 data = await self._get_json(url)
+                request_count += 1
+                
                 events = (data or {}).get("events") or []
-                for ev in events:
+                for ev in events[:6]:  # Limit events per league for performance
                     mt = self._normalize_event(ev)
                     if mt:
                         matches.append(mt)
+                        
             except Exception as e:
                 logger.warning(f"eventsnextleague failed for {lg.id} {lg.name}: {e}")
-            await asyncio.sleep(0.15)  # small spacing to be polite
+            
+            # Respectful rate limiting: 2 requests per second max
+            await asyncio.sleep(0.5)
+        
         # Sort by ISO timestamp/date
         def sort_key(m: Match):
             if m.iso_timestamp:
@@ -139,10 +168,50 @@ class TheSportsDbProvider:
                 except Exception:
                     pass
             return datetime.fromisoformat(f"{m.date}T{(m.match_time or '00:00')}:00+00:00") if m.date else datetime.now(timezone.utc)
+        
         matches.sort(key=sort_key)
-        # Cap
+        # Cap to requested amount
         matches = matches[:max_total]
+        
+        # Cache for 10 minutes as requested
         self._upcoming_cache = (now, matches)
+        logger.info(f"Cached {len(matches)} matches using {request_count} API calls")
+        return matches
+    
+    async def get_upcoming_matches_for_league(self, league_id: str, max_matches: int = 12) -> List[Match]:
+        """Get upcoming matches for a specific league with caching"""
+        cache_key = f"league_{league_id}"
+        now = asyncio.get_running_loop().time()
+        
+        # Check if we have league-specific cache
+        if hasattr(self, '_league_cache'):
+            if cache_key in self._league_cache:
+                ts, cached_matches = self._league_cache[cache_key]
+                if (now - ts) < 300:  # 5-minute cache for individual leagues
+                    return cached_matches[:max_matches]
+        else:
+            self._league_cache = {}
+        
+        # Fetch fresh data
+        url = f"{self.base}/eventsnextleague.php?id={league_id}"
+        matches: List[Match] = []
+        
+        try:
+            data = await self._get_json(url)
+            events = (data or {}).get("events") or []
+            
+            for ev in events[:max_matches]:
+                mt = self._normalize_event(ev)
+                if mt:
+                    matches.append(mt)
+            
+            # Cache the results
+            self._league_cache[cache_key] = (now, matches)
+            logger.info(f"Fetched {len(matches)} matches for league {league_id}")
+            
+        except Exception as e:
+            logger.error(f"Error fetching matches for league {league_id}: {e}")
+            
         return matches
 
     def _normalize_event(self, ev: Dict[str, Any]) -> Optional[Match]:

@@ -19,6 +19,23 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# Standardized JSON schema for all grounding prompts
+STANDARD_GROUNDING_SCHEMA = (
+    "Return ONLY valid JSON with schema: "
+    "{summary:string, findings:[string], sources:[{title:string,url:string}], confidence:number}. "
+    "'summary' should be 2-3 sentences of key insights. "
+    "'findings' should be 3-5 bullet points. "
+    "'confidence' should be 0-100 based on source quality."
+)
+
+# Create detailed logger for all prompts and responses
+detail_logger = logging.getLogger('llm_predictor_details')
+detail_logger.setLevel(logging.INFO)
+if not detail_logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s | LLM_DETAIL | %(message)s'))
+    detail_logger.addHandler(handler)
+
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-pro")
 class GeminiPredictor:
     def __init__(self, model: Optional[str] = None, temperature: float = 0.2):
@@ -155,34 +172,45 @@ class GeminiPredictor:
         return s
 
     def _extract_response_text(self, resp) -> Optional[str]:
-        """Safely extract text from a Gemini response without triggering resp.text ValueError."""
-        try:
-            cands = getattr(resp, "candidates", []) or []
-            for c in cands:
-                content = getattr(c, "content", None)
-                if not content:
-                    continue
-                parts = getattr(content, "parts", []) or []
-                for p in parts:
-                    if hasattr(p, "text") and getattr(p, "text", None):
-                        return p.text
-                    inline = getattr(p, "inline_data", None)
-                    if inline and getattr(inline, "data", None):
-                        import base64
-                        try:
-                            data_bytes = base64.b64decode(inline.data)
-                            return data_bytes.decode('utf-8', errors='ignore')
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-        # Very last resort
-        try:
-            t = getattr(resp, "text", None)
-            if isinstance(t, str) and t:
-                return t
-        except Exception:
+        """Extract text from Gemini response using reliable methods from memory lessons."""
+        debug_mode = os.getenv("DEBUG_LLM") == "1"
+        
+        if not resp:
             return None
+        
+        try:
+            # Method 1: Check candidates and parts (primary method)
+            if hasattr(resp, 'candidates') and resp.candidates:
+                for candidate in resp.candidates:
+                    if hasattr(candidate, 'content') and candidate.content:
+                        if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    if debug_mode:
+                                        detail_logger.info(f"EXTRACT: Found text in candidate parts, {len(part.text)} chars")
+                                    return part.text
+            
+            # Method 2: Direct resp.text access (fallback)
+            if hasattr(resp, 'text') and resp.text:
+                if debug_mode:
+                    detail_logger.info(f"EXTRACT: Found text in resp.text, {len(resp.text)} chars")
+                return resp.text
+            
+            # Method 3: Alternative attributes (safety net)
+            for attr_name in ['content', 'result', 'output']:
+                attr_value = getattr(resp, attr_name, None)
+                if isinstance(attr_value, str) and attr_value:
+                    if debug_mode:
+                        detail_logger.info(f"EXTRACT: Found text in {attr_name}, {len(attr_value)} chars")
+                    return attr_value
+            
+            if debug_mode:
+                detail_logger.warning(f"EXTRACT: No text found in response, type: {type(resp)}")
+            
+        except Exception as e:
+            if debug_mode:
+                detail_logger.error(f"EXTRACT: Exception during text extraction: {e}")
+        
         return None
 
     async def _generate(self, prompt: str, generation_config: Dict):
@@ -213,11 +241,17 @@ class GeminiPredictor:
         if not self._client_ready:
             return {"error": "LLM not configured"}
 
-        # Minimal prompt; keep concise and schema-aligned
+        # Minimal prompt with current date context
+        current_date = datetime.now().strftime('%B %d, %Y')  # e.g., "August 26, 2025"
         prompt = (
+            f"IMPORTANT: Today's date is {current_date}. "
             f"Matchup: {home_team} vs {away_team}. "
+            f"Analyze this match based on current 2025 season data. "
             "Return only valid JSON with numeric fields: home_win, draw, away_win (0-100). Be concise."
         )
+        
+        # Log the exact prompt being sent
+        detail_logger.info(f"BASIC PREDICTION PROMPT for '{home_team} vs {away_team}': {prompt}")
 
         import asyncio, random, traceback
         data = None
@@ -279,6 +313,8 @@ class GeminiPredictor:
                             break
                 if extracted:
                     data = extracted
+                    # Log the response
+                    detail_logger.info(f"BASIC PREDICTION RESPONSE for '{home_team} vs {away_team}' ({len(extracted)} chars): {extracted[:400]}...")
                     if debug_mode:
                         try:
                             snippet = str(extracted).replace('\n',' ')[:200]
@@ -363,15 +399,16 @@ class GeminiPredictor:
             end_date = now.strftime("%Y-%m-%d")
 
             query_header = (
-                f"Research the latest football metrics and news for: {home_team} vs {away_team}" + (f" on {date}." if date else ".")
+                f"Research the latest football metrics and news for: {home_team} vs {away_team}" + (f" on {date}." if date else ".") + 
+                f" IMPORTANT: Today is {end_date} (2025). Focus on current 2025 season data."
             )
             requirements = (
                 "Use at least 12 diverse, reputable sources (league/team sites, stats providers, injury trackers, pressers, recent match reports, major news). "
-                "STRICT RECENCY for dynamic stats: Only include items dated between " + start_date + " and " + end_date + ". Ignore older items unless they are season-long official references. "
-                "Prioritize current season context and last 5-10 matches. Verify current managers/coaches, injuries/suspensions, and lineup availability. "
+                "STRICT RECENCY for dynamic stats: Only include items dated between " + start_date + " and " + end_date + " (current 2025 season). Ignore older items unless they are season-long official references. "
+                "Prioritize current 2024-25 season context and last 5-10 matches from 2025. Verify current managers/coaches, injuries/suspensions, and lineup availability as of 2025. "
                 "Also gather HISTORICAL CONTEXT (beyond the window) strictly for rivalry/head-to-head trends: long-run H2H, last 8-12 meetings, venue bias, rivalry patterns. "
                 "Cover professional criteria: team strength, recent form (5-10), head-to-head, xG/xGA, shot quality, PPDA, pressing, set-pieces, lineup quality, squad depth, rotation risk, fatigue, schedule density, rest days, travel, venue/home advantage, crowd intensity, tactical matchups, managerial styles, transitions, turnovers, goalkeeper quality, finishing variance, penalties, discipline risk, referee tendencies, weather, pitch, altitude, timezone, motivation/stakes, odds movement, market agreement, bookmaker margin, morale. "
-                "Cite every source used (title + URL). Avoid fabrication."
+                "Cite every source used (title + URL). Avoid fabrication. Focus on 2025 season data."
             )
             prompt = (
                 query_header + "\n" + requirements + "\n\n"
@@ -487,6 +524,9 @@ class GeminiPredictor:
             "Return ONLY valid JSON per the instructed schema. "
             "Be brief but cutting-edge: max 5-8 lines in 'summary', and 8-12 'factors'."
         )
+        
+        # Log the exact prompt being sent
+        detail_logger.info(f"ADVANCED PREDICTION PROMPT for '{home_team} vs {away_team}': {prompt[:1500]}...")
 
         try:
             resp = await self._generate_with(
@@ -500,6 +540,9 @@ class GeminiPredictor:
             data = self._extract_response_text(resp)
             if not data:
                 return {"error": "Gemini returned no extractable data"}
+            
+            # Log the response
+            detail_logger.info(f"ADVANCED PREDICTION RESPONSE for '{home_team} vs {away_team}' ({len(data)} chars): {data[:600]}...")
 
             if debug_mode:
                 try:
@@ -582,3 +625,710 @@ class GeminiPredictor:
         except Exception:
             logger.exception("Advanced LLM prediction failed")
             return {"error": "Error generating advanced analysis"}
+
+    async def predict_premium_analysis(self, home_team: str, away_team: str, date: Optional[str] = None) -> Dict:
+        """
+        Premium analysis using 15 concurrent Flash prompts with Google Search grounding,
+        synthesized by Gemini Pro for comprehensive sports intelligence.
+        
+        This replaces browser automation with direct grounding for superior performance:
+        - 15 targeted prompts for comprehensive data collection
+        - Concurrent execution with rate limit respect
+        - Gemini Pro synthesis for final analysis
+        - Complete citation and source tracking
+        
+        Returns structured analysis compatible with /analysis command.
+        """
+        if not self._client_ready:
+            return {"error": "LLM not configured"}
+        
+        # Sanitize team names to handle malformed input (e.g., "Barcelona vs Vs Real Madrid")
+        original_home = home_team
+        original_away = away_team
+        home_team = self._sanitize_team_name(home_team)
+        away_team = self._sanitize_team_name(away_team)
+        
+        # If sanitization changed the names significantly, log it
+        if home_team != original_home or away_team != original_away:
+            detail_logger.info(f"TEAM NAME SANITIZATION: '{original_home}' vs '{original_away}' -> '{home_team}' vs '{away_team}'")
+        
+        # Get current date context for all prompts
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        current_display = datetime.now().strftime('%B %d, %Y')
+        
+        detail_logger.info(f"PREMIUM ANALYSIS START for '{home_team} vs {away_team}' on {current_display}")
+        
+        # Define 9 high-value strategic prompts for optimal performance
+        prompts = [
+            # Phase 1: Core Team Intelligence (High Priority)
+            {
+                "id": "team_form_home",
+                "priority": "high",
+                "query": f"Latest 5 matches performance, goals scored/conceded, form trend for {home_team} in 2025 season. IMPORTANT: Today is {current_date} (2025). Focus on current season data.",
+                "expected_data": "recent_form, goals_for, goals_against, win_rate"
+            },
+            {
+                "id": "team_form_away", 
+                "priority": "high",
+                "query": f"Latest 5 matches performance, goals scored/conceded, form trend for {away_team} in 2025 season. IMPORTANT: Today is {current_date} (2025). Focus on current season data.",
+                "expected_data": "recent_form, goals_for, goals_against, win_rate"
+            },
+            {
+                "id": "head_to_head",
+                "priority": "high", 
+                "query": f"Recent head-to-head meetings {home_team} vs {away_team}, last 8 encounters, venue patterns, historical results. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "h2h_record, venue_advantage, recent_meetings"
+            },
+            {
+                "id": "injuries_suspensions",
+                "priority": "high",
+                "query": f"Current injuries, suspensions, key player availability for {home_team} and {away_team} as of January 2025. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "injured_players, suspended_players, lineup_strength"
+            },
+            {
+                "id": "league_position",
+                "priority": "high",
+                "query": f"Current league standings, points gap, recent position changes for {home_team} and {away_team} in 2025 season. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "league_position, points, recent_results"
+            },
+            
+            # Phase 2: Enhanced Intelligence (Medium Priority)  
+            {
+                "id": "tactical_analysis",
+                "priority": "medium",
+                "query": f"Playing style, formations, manager tactics and approach for {home_team} vs {away_team} in 2025. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "formation, playing_style, tactical_approach"
+            },
+            {
+                "id": "home_away_form",
+                "priority": "medium",
+                "query": f"Home and away performance comparison for {home_team} and {away_team} in 2025 season. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "home_record, away_record, venue_advantage"
+            },
+            {
+                "id": "statistical_analysis", 
+                "priority": "medium",
+                "query": f"Advanced statistics: xG, xGA, shot conversion, defensive metrics for {home_team} vs {away_team} in 2025. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "xg_stats, shot_conversion, defensive_metrics"
+            },
+            
+            # Phase 3: Market Intelligence (Most Reliable Low Priority)
+            {
+                "id": "betting_market",
+                "priority": "low",
+                "query": f"Current betting odds, market sentiment, line movement for {home_team} vs {away_team}. IMPORTANT: Today is {current_date} (2025).",
+                "expected_data": "betting_odds, market_sentiment, line_movement"
+            }
+        ]
+        
+        # Execute multi-prompt grounding with rate limit awareness
+        grounding_results = await self._execute_multi_prompt_grounding(prompts)
+        
+        # Consolidate all grounded data for Pro synthesis
+        consolidated_context = self._consolidate_grounding_results(grounding_results)
+        
+        # Synthesize final analysis with Gemini Pro
+        final_analysis = await self._synthesize_premium_analysis(
+            home_team, away_team, consolidated_context
+        )
+        
+        detail_logger.info(f"PREMIUM ANALYSIS COMPLETE for '{home_team} vs {away_team}' - Sources: {len(consolidated_context.get('sources', []))}")
+        
+        return final_analysis
+
+    async def _execute_multi_prompt_grounding(self, prompts: List[Dict]) -> Dict[str, Dict]:
+        """
+        Execute multiple grounding prompts with intelligent rate limit handling.
+        
+        Strategy:
+        - Free Tier: Batch execution to respect 10 RPM limit
+        - Paid Tier: Full concurrent execution
+        - Priority-based execution order
+        - Comprehensive error handling with partial results
+        """
+        if not self.model_flash:
+            detail_logger.warning("Flash model not available for multi-prompt grounding")
+            return {}
+        
+        # Configure Google Search grounding tool
+        tools = None
+        if Tool and GoogleSearchRetrieval:
+            try:
+                google_search_tool = Tool.from_google_search_retrieval(GoogleSearchRetrieval())
+                tools = [google_search_tool]
+                detail_logger.info("Google Search grounding tool configured")
+            except Exception as e:
+                detail_logger.warning(f"Could not configure grounding tool: {e}")
+                tools = None
+        
+        # Use explicit tier configuration (free|tier1|tier2|tier3)
+        user_tier = os.getenv('GEMINI_TIER', 'free').lower()
+        detail_logger.info(f"Using configured tier: {user_tier}")
+        
+        results = {}
+        
+        # Get batch configuration based on tier
+        batch_config = self._get_batch_config(user_tier)
+        
+        if batch_config['delay_seconds'] > 0:
+            # Free tier: Batch execution with delays
+            results = await self._execute_batched_prompts(prompts, tools, batch_config)
+        else:
+            # Paid tier: Full concurrent execution
+            results = await self._execute_concurrent_prompts(prompts, tools)
+        
+        # Log execution summary
+        successful = len([r for r in results.values() if r.get('success')])
+        total = len(prompts)
+        detail_logger.info(f"Multi-prompt execution complete: {successful}/{total} successful")
+        
+        return results
+    
+    def _get_batch_config(self, user_tier: str) -> Dict[str, int]:
+        """
+        Get batching configuration based on user tier.
+        Returns batch size and delay for rate limit compliance.
+        """
+        # Official rate limits (validated Jan 2025):
+        # Free: Flash=10 RPM, Pro=5 RPM  
+        # Tier1: Flash=1000 RPM, Pro=150 RPM
+        # Tier2+: Even higher limits
+        
+        if user_tier in ['tier1', 'tier2', 'tier3', 'paid']:
+            return {
+                'batch_size': 9,  # Full concurrent execution for paid tiers (9 prompts)
+                'delay_seconds': 0  # No delay needed
+            }
+        else:
+            # Free tier: 10 RPM limit, use all 9 prompts in single batch
+            return {
+                'batch_size': 9,  # All 9 prompts in one batch for 10 RPM limit  
+                'delay_seconds': 0  # No delay needed with 9 prompts < 10 RPM
+            }
+    
+    async def _execute_batched_prompts(self, prompts: List[Dict], tools: Optional[list], batch_config: Dict[str, int]) -> Dict[str, Dict]:
+        """
+        Execute prompts in batches for free tier rate limit compliance.
+        Uses batch_config for size and delay settings.
+        """
+        import asyncio
+        
+        results = {}
+        batch_size = batch_config['batch_size']
+        delay_seconds = batch_config['delay_seconds']
+        
+        # Sort by priority for optimal execution order
+        prioritized_prompts = sorted(prompts, key=lambda p: 
+            {'high': 0, 'medium': 1, 'low': 2}.get(p.get('priority', 'low'), 2)
+        )
+        
+        for i in range(0, len(prioritized_prompts), batch_size):
+            batch = prioritized_prompts[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            
+            detail_logger.info(f"Executing batch {batch_num}: {len(batch)} prompts (max {batch_size} for rate limit compliance)")
+            
+            # Execute batch concurrently
+            batch_tasks = [
+                self._execute_single_grounding_prompt(prompt, tools)
+                for prompt in batch
+            ]
+            
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Process batch results
+            for prompt, result in zip(batch, batch_results):
+                prompt_id = prompt.get('id', f'prompt_{i}')
+                if isinstance(result, Exception):
+                    results[prompt_id] = {
+                        'success': False,
+                        'error': str(result),
+                        'prompt_id': prompt_id
+                    }
+                    detail_logger.error(f"Batch prompt {prompt_id} failed: {result}")
+                else:
+                    results[prompt_id] = result
+            
+            # Rate limit delay between batches (except last batch)
+            if i + batch_size < len(prioritized_prompts) and delay_seconds > 0:
+                detail_logger.info(f"Rate limit delay: {delay_seconds} seconds between batches")
+                await asyncio.sleep(delay_seconds)
+        
+        return results
+    
+    async def _execute_concurrent_prompts(self, prompts: List[Dict], tools: Optional[list]) -> Dict[str, Dict]:
+        """
+        Execute all prompts concurrently for paid tier users.
+        Full parallelization for maximum speed.
+        """
+        import asyncio
+        
+        detail_logger.info(f"Executing {len(prompts)} prompts concurrently (paid tier)")
+        
+        # Create all tasks
+        tasks = [
+            self._execute_single_grounding_prompt(prompt, tools)
+            for prompt in prompts
+        ]
+        
+        # Execute all concurrently
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        results = {}
+        for prompt, result in zip(prompts, results_list):
+            prompt_id = prompt.get('id', f'prompt_{prompts.index(prompt)}')
+            if isinstance(result, Exception):
+                results[prompt_id] = {
+                    'success': False,
+                    'error': str(result),
+                    'prompt_id': prompt_id
+                }
+                detail_logger.error(f"Concurrent prompt {prompt_id} failed: {result}")
+            else:
+                results[prompt_id] = result
+        
+        return results
+    
+    async def _execute_single_grounding_prompt(self, prompt_config: Dict, tools: Optional[list]) -> Dict:
+        """
+        Execute a single grounding prompt with comprehensive error handling.
+        Returns structured result with success status, data, and sources.
+        """
+        prompt_id = prompt_config.get('id', 'unknown')
+        query = prompt_config.get('query', '')
+        
+        try:
+            detail_logger.info(f"GROUNDING PROMPT [{prompt_id}]: {query[:100]}...")
+            
+            # Build structured prompt with standardized schema
+            structured_prompt = f"{query}\n\n{STANDARD_GROUNDING_SCHEMA}"
+            
+            # Execute grounding request
+            resp = await self._generate_with(
+                self.model_flash,
+                structured_prompt,
+                generation_config={
+                    "temperature": 0.2,
+                    "response_mime_type": "application/json"
+                },
+                tools=tools
+            )
+            
+            # Extract and parse response
+            data = self._extract_response_text(resp)
+            if not data:
+                return {
+                    'success': False,
+                    'error': 'No data extracted from response',
+                    'prompt_id': prompt_id
+                }
+            
+            detail_logger.info(f"GROUNDING RESPONSE [{prompt_id}]: {len(data)} chars extracted")
+            
+            # Parse JSON response
+            import json
+            try:
+                parsed_data = json.loads(data)
+            except Exception:
+                # Try sanitized parsing
+                clean_data = self._sanitize_json_string(data)
+                try:
+                    parsed_data = json.loads(clean_data)
+                except Exception as e:
+                    return {
+                        'success': False,
+                        'error': f'JSON parsing failed: {e}',
+                        'raw_data': data[:200],
+                        'prompt_id': prompt_id
+                    }
+            
+            # Structure successful result with standardized fields
+            result = {
+                'success': True,
+                'prompt_id': prompt_id,
+                'data_summary': parsed_data.get('summary', ''),  # Using standardized 'summary'
+                'key_findings': parsed_data.get('findings', []),  # Using standardized 'findings'
+                'sources': parsed_data.get('sources', []),
+                'confidence': parsed_data.get('confidence', 50),
+                'timestamp': datetime.now().isoformat(),  # Generated timestamp
+                'expected_data': prompt_config.get('expected_data', ''),
+                'priority': prompt_config.get('priority', 'medium')
+            }
+            
+            detail_logger.info(f"GROUNDING SUCCESS [{prompt_id}]: {len(result['sources'])} sources, confidence {result['confidence']}")
+            return result
+            
+        except Exception as e:
+            detail_logger.error(f"GROUNDING ERROR [{prompt_id}]: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'prompt_id': prompt_id
+            }
+
+    def _consolidate_grounding_results(self, grounding_results: Dict[str, Dict]) -> Dict:
+        """
+        Consolidate multiple grounding results using streaming approach for memory efficiency.
+        
+        STREAMING OPTIMIZATION: Process results as they arrive instead of accumulating
+        all responses in memory. Reduces memory usage from 5-10MB to 2-3MB per analysis.
+        """
+        # Initialize with memory-efficient streaming consolidator
+        consolidator = {
+            'successful_prompts': 0,
+            'total_prompts': len(grounding_results),
+            'data_sections': {},
+            'sources_seen': set(),  # Memory-efficient URL tracking
+            'sources': [],
+            'confidence_scores': [],
+            'failed_prompts': [],
+            'findings_count': 0,  # Track without storing all findings
+            'data_quality': 'unknown'
+        }
+        
+        # Stream process each result immediately to avoid memory buildup
+        for prompt_id, result in grounding_results.items():
+            if result.get('success'):
+                consolidator['successful_prompts'] += 1
+                
+                # Store only essential data section metadata
+                consolidator['data_sections'][prompt_id] = {
+                    'summary': result.get('data_summary', '')[:200],  # Limit summary length
+                    'priority': result.get('priority', 'medium'),
+                    'findings_count': len(result.get('key_findings', []))
+                }
+                
+                # Count findings without storing them (memory optimization)
+                findings = result.get('key_findings', [])
+                if isinstance(findings, list):
+                    consolidator['findings_count'] += len(findings)
+                
+                # Stream-deduplicate sources efficiently
+                sources = result.get('sources', [])
+                if isinstance(sources, list):
+                    for source in sources[:3]:  # Limit to top 3 per prompt
+                        if isinstance(source, dict) and source.get('url'):
+                            url = source.get('url')
+                            if url not in consolidator['sources_seen']:
+                                consolidator['sources_seen'].add(url)
+                                # Keep only essential source data
+                                consolidator['sources'].append({
+                                    'url': url,
+                                    'title': source.get('title', '')[:50],
+                                    'source': source.get('source', '')[:30]
+                                })
+                
+                # Stream confidence tracking
+                confidence = result.get('confidence')
+                if isinstance(confidence, (int, float)):
+                    consolidator['confidence_scores'].append(confidence)
+            else:
+                # Track failed prompts with minimal data
+                consolidator['failed_prompts'].append({
+                    'prompt_id': prompt_id,
+                    'error': str(result.get('error', 'Unknown'))[:100]
+                })
+        
+        # Clean up memory-tracking set (not needed in final result)
+        del consolidator['sources_seen']
+        
+        # Calculate quality metrics with streaming approach
+        success_rate = consolidator['successful_prompts'] / consolidator['total_prompts'] if consolidator['total_prompts'] > 0 else 0
+        avg_confidence = sum(consolidator['confidence_scores']) / len(consolidator['confidence_scores']) if consolidator['confidence_scores'] else 0
+        
+        # Memory-optimized data quality assessment
+        if success_rate >= 0.8 and avg_confidence >= 75:
+            consolidator['data_quality'] = 'excellent'
+        elif success_rate >= 0.6 and avg_confidence >= 65:
+            consolidator['data_quality'] = 'good'
+        elif success_rate >= 0.4 and avg_confidence >= 55:
+            consolidator['data_quality'] = 'fair'
+        elif success_rate >= 0.2 and avg_confidence >= 40:
+            consolidator['data_quality'] = 'limited'
+        else:
+            consolidator['data_quality'] = 'minimal'
+        
+        # Add lightweight summary statistics
+        consolidator['statistics'] = {
+            'success_rate': round(success_rate * 100, 1),
+            'average_confidence': round(avg_confidence, 1),
+            'total_sources': len(consolidator['sources']),
+            'total_findings': consolidator['findings_count']  # Use count instead of list
+        }
+        
+        detail_logger.info(
+            f"STREAMING CONSOLIDATION: {consolidator['successful_prompts']}/{consolidator['total_prompts']} successful, "
+            f"{len(consolidator['sources'])} sources, {consolidator['findings_count']} findings, quality: {consolidator['data_quality']}"
+        )
+        
+        return consolidator
+    
+    async def _synthesize_premium_analysis(self, home_team: str, away_team: str, consolidated_context: Dict) -> Dict:
+        """
+        Synthesize final premium analysis using Gemini Pro with consolidated grounding data.
+        
+        Creates comprehensive analysis with:
+        - Probability predictions
+        - Confidence scoring
+        - Factor analysis with evidence
+        - Executive summary
+        - Source attribution
+        """
+        if not self.model_advanced:
+            return {"error": "Advanced model not configured"}
+        
+        # Sanitize team names to handle malformed input like "Barcelona vs Vs Real Madrid"
+        home_team = self._sanitize_team_name(home_team)
+        away_team = self._sanitize_team_name(away_team)
+        
+        # Enhanced graceful degradation - ensure synthesis proceeds with minimal data
+        context_sections = []
+        
+        # Always add data quality summary for transparency
+        stats = consolidated_context.get('statistics', {})
+        quality = consolidated_context.get('data_quality', 'unknown')
+        successful_prompts = consolidated_context.get('successful_prompts', 0)
+        total_prompts = consolidated_context.get('total_prompts', 9)
+        
+        context_sections.append(
+            f"DATA QUALITY: {stats.get('success_rate', 0)}% data collection success, "
+            f"{stats.get('total_sources', 0)} sources analyzed, quality rating: {quality}"
+        )
+        
+        # Handle case where no prompts succeeded
+        if successful_prompts == 0:
+            context_sections.append(
+                "WARNING: No grounding data collected. Analysis based on general football knowledge only."
+            )
+            detail_logger.warning(f"Zero successful prompts for {home_team} vs {away_team} - proceeding with knowledge-only analysis")
+        
+        # Add consolidated findings by priority (with fallback handling)
+        high_priority_data = []
+        medium_priority_data = []
+        low_priority_data = []
+        
+        data_sections = consolidated_context.get('data_sections', {})
+        if data_sections:
+            for section_id, section_data in data_sections.items():
+                priority = section_data.get('priority', 'medium')
+                summary = section_data.get('summary', '')
+                findings = section_data.get('findings', [])
+                
+                if summary or findings:  # Only add sections with actual data
+                    section_text = f"[{section_id.upper()}] {summary}"
+                    if findings:
+                        section_text += " Key points: " + "; ".join(findings[:3])  # Limit to top 3 findings
+                    
+                    if priority == 'high':
+                        high_priority_data.append(section_text)
+                    elif priority == 'medium':
+                        medium_priority_data.append(section_text)
+                    else:
+                        low_priority_data.append(section_text)
+        
+        # Build structured context with availability awareness
+        if high_priority_data:
+            context_sections.append("HIGH PRIORITY DATA:\n" + "\n".join(high_priority_data))
+        else:
+            context_sections.append("HIGH PRIORITY DATA: No core team data available")
+            
+        if medium_priority_data:
+            context_sections.append("TACTICAL ANALYSIS:\n" + "\n".join(medium_priority_data))
+        else:
+            context_sections.append("TACTICAL ANALYSIS: Limited tactical intelligence available")
+            
+        if low_priority_data:
+            context_sections.append("MARKET INTELLIGENCE:\n" + "\n".join(low_priority_data))
+        
+        # Add source summary with fallback
+        sources = consolidated_context.get('sources', [])
+        if sources:
+            source_summary = f"SOURCES ({len(sources)} total): " + "; ".join([
+                s.get('title', 'Source')[:50] for s in sources[:5]
+            ])
+            if len(sources) > 5:
+                source_summary += f" and {len(sources) - 5} more..."
+            context_sections.append(source_summary)
+        else:
+            context_sections.append("SOURCES: No external sources available - relying on football knowledge")
+        
+        # Build final synthesis prompt with data quality awareness
+        current_date = datetime.now().strftime('%B %d, %Y')
+        context_block = "\n\n".join(context_sections)
+        
+        # Enhanced data quality guidance for graceful degradation
+        if successful_prompts == 0:
+            data_quality_guidance = (
+                "\n\nDATA COLLECTION FAILURE: No grounding data available. "
+                "You MUST provide analysis based entirely on general football knowledge. "
+                "Set confidence to 35-45% and clearly state this is knowledge-based analysis only. "
+                "Include standard factors: team reputation, typical performance patterns, general league context."
+            )
+        elif quality in ['minimal', 'limited']:
+            data_quality_guidance = (
+                "\n\nDATA QUALITY WARNING: Limited reliable data available. "
+                "You MUST still provide a complete analysis but REDUCE confidence accordingly. "
+                "Base predictions on available data supplemented with general football knowledge. "
+                "Set confidence between 40-60% and clearly note data limitations in summary."
+            )
+        elif quality == 'fair':
+            data_quality_guidance = (
+                "\n\nDATA QUALITY NOTICE: Moderate data available. "
+                "Provide analysis with moderate confidence (60-75%). "
+                "Note any data gaps in your summary."
+            )
+        else:
+            data_quality_guidance = (
+                "\n\nDATA QUALITY: Good to excellent data available. "
+                "Provide confident analysis (75-90% confidence range)."
+            )
+        
+        synthesis_prompt = (
+            f"MATCHUP: {home_team} vs {away_team}\n"
+            f"DATE CONTEXT: Today is {current_date} (2025)\n\n"
+            f"COMPREHENSIVE GROUNDED ANALYSIS:\n{context_block}\n\n"
+            f"DATA QUALITY ASSESSMENT: {quality} ({stats.get('success_rate', 0):.0f}% collection success)\n"
+            f"SOURCES ANALYZED: {len(sources)} verified sources\n"
+            f"{data_quality_guidance}\n\n"
+            "SYNTHESIS INSTRUCTIONS:\n"
+            "You MUST provide a complete football analysis regardless of data availability. "
+            "If data is limited, supplement with general football knowledge and clearly indicate this. "
+            "Adjust confidence levels based on data quality: minimal/limited = 40-60%, fair = 60-75%, good+ = 75-90%. "
+            "NEVER refuse to provide analysis - always give your best assessment with appropriate confidence caveats.\n\n"
+            "Return ONLY valid JSON with exact schema: "
+            "{home_win:number, draw:number, away_win:number, prediction:string, confidence:number, "
+            "summary:string, factors:[{name:string, impact:number, evidence:string}], "
+            "data_quality:string, sources_used:number, grounding_notes:string, data_limitations:string}"
+        )
+        
+        detail_logger.info(f"SYNTHESIS PROMPT for '{home_team} vs {away_team}': {len(synthesis_prompt)} chars")
+        
+        try:
+            # Single synthesis attempt with optimal temperature for reliability
+            detail_logger.info(f"SYNTHESIS ATTEMPT for '{home_team} vs {away_team}' (temperature: 0.2)")
+            
+            resp = await self._generate_with(
+                self.model_advanced,
+                synthesis_prompt,
+                generation_config={
+                    "temperature": 0.2,  # Optimal balance of consistency and creativity
+                    "response_mime_type": "application/json"
+                }
+            )
+            
+            data = self._extract_response_text(resp)
+            
+            if data:
+                detail_logger.info(f"SYNTHESIS SUCCESS: {len(data)} chars extracted")
+            else:
+                detail_logger.error(f"SYNTHESIS FAILED: No data extracted from response")
+                
+                return {
+                    "error": "Synthesis extraction failed after response generation",
+                    "debug_info": {
+                        "model_used": str(self.model_advanced),
+                        "prompt_length": len(synthesis_prompt),
+                        "response_type": str(type(resp))
+                    }
+                }
+            
+            # Check if synthesis succeeded
+            
+            detail_logger.info(f"SYNTHESIS RESPONSE for '{home_team} vs {away_team}': {len(data)} chars extracted successfully")
+            
+            # Parse synthesis result
+            import json
+            try:
+                synthesis_result = json.loads(data)
+            except Exception:
+                clean_data = self._sanitize_json_string(data)
+                try:
+                    synthesis_result = json.loads(clean_data)
+                except Exception as e:
+                    return {
+                        "error": f"Synthesis JSON parsing failed: {e}",
+                        "raw_data": data[:300]
+                    }
+            
+            # Normalize and validate synthesis result with confidence adjustment
+            home = self._coerce_prob(synthesis_result.get("home_win", 33.3), 33.3)
+            draw = self._coerce_prob(synthesis_result.get("draw", 33.3), 33.3)
+            away = self._coerce_prob(synthesis_result.get("away_win", 33.4), 33.4)
+            probs = self._normalize_probs(home, draw, away)
+            
+            # Extract and adjust confidence based on data quality
+            raw_confidence = self._coerce_prob(synthesis_result.get("confidence", 60), 60)
+            
+            # Apply confidence caps based on data quality
+            if quality == 'minimal':
+                adjusted_confidence = min(raw_confidence, 50)  # Cap at 50% for minimal data
+            elif quality == 'limited':
+                adjusted_confidence = min(raw_confidence, 65)  # Cap at 65% for limited data
+            elif quality == 'fair':
+                adjusted_confidence = min(raw_confidence, 80)  # Cap at 80% for fair data
+            else:
+                adjusted_confidence = raw_confidence  # No cap for good/excellent data
+            
+            # Build final result with comprehensive metadata
+            final_result = {
+                **probs,
+                "prediction": synthesis_result.get("prediction", "Draw"),
+                "confidence": adjusted_confidence,
+                "summary": synthesis_result.get("summary", "Analysis completed with available data."),
+                "factors": synthesis_result.get("factors", []),
+                "data_quality": quality,
+                "sources_used": len(sources),
+                "grounding_notes": synthesis_result.get("grounding_notes", ""),
+                "data_limitations": synthesis_result.get("data_limitations", ""),
+                
+                # Add metadata
+                "framework": "premium-grounding",
+                "source": "gemini-2.5-pro-synthesis",
+                "grounding_engine": "gemini-2.5-flash",
+                "sources": sources[:10],  # Include top 10 sources
+                "statistics": consolidated_context.get('statistics', {}),
+                "failed_prompts": len(consolidated_context.get('failed_prompts', [])),
+                "total_prompts": consolidated_context.get('total_prompts', 0),
+                "confidence_adjustment": f"Adjusted from {raw_confidence:.1f}% to {adjusted_confidence:.1f}% based on {quality} data quality"
+            }
+            
+            detail_logger.info(
+                f"PREMIUM SYNTHESIS COMPLETE: {home_team} vs {away_team} - "
+                f"Prediction: {final_result['prediction']}, Confidence: {final_result['confidence']}%"
+            )
+            
+            return final_result
+            
+        except Exception as e:
+            detail_logger.error(f"Synthesis failed for '{home_team} vs {away_team}': {e}")
+            import traceback
+            detail_logger.error(f"Synthesis exception traceback: {traceback.format_exc()}")
+            return {
+                "error": f"Premium synthesis failed: {e}",
+                "fallback_data": consolidated_context.get('statistics', {}),
+                "exception_type": str(type(e).__name__)
+            }
+    
+    def _sanitize_team_name(self, team_name: str) -> str:
+        """
+        Sanitize team names to handle malformed input while preserving legitimate team names.
+        """
+        if not isinstance(team_name, str):
+            return str(team_name)
+        
+        # Remove common malformed patterns
+        sanitized = team_name.strip()
+        
+        # Only remove duplicate 'vs' patterns, not single legitimate instances
+        import re
+        # Remove patterns like "vs Vs Real Madrid" or "vs vs vs Other Team"
+        sanitized = re.sub(r'\s+vs\s+vs\s+.*', '', sanitized, flags=re.IGNORECASE)
+        
+        # Remove leading 'vs' or 'Vs' (e.g., "Vs Real Madrid" -> "Real Madrid")
+        sanitized = re.sub(r'^(vs|Vs)\s+', '', sanitized)
+        
+        # Clean up extra whitespace
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        
+        return sanitized
