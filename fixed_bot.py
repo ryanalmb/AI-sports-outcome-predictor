@@ -2,15 +2,17 @@
 Sports Prediction Telegram Bot (LLM-first, no DB, no heavy ML)
 """
 import asyncio
+import json
 import logging
 import os
 from typing import Dict, Optional, Tuple, List
 
+import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, RetryAfter, NetworkError
+from telegram.error import TimedOut, RetryAfter, NetworkError, BadRequest
 
 from simple_football_api import SimpleFootballAPI  # legacy for other features
 from providers.thesportsdb_provider import TheSportsDbProvider
@@ -18,6 +20,9 @@ from enhanced_predictions import EnhancedPredictionEngine
 # from advanced_prediction_engine import AdvancedPredictionEngine  # Disabled: LLM-only mode
 from llm_predictor import GeminiPredictor
 from browser_analysis_engine import BrowserAnalysisEngine
+
+# Import LiveSession for degenanalyze feature
+from live.live_session import LiveSession
 
 logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
@@ -36,7 +41,10 @@ class SimpleSportsBot:
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
         # Longer timeouts to avoid ReadTimeout from Telegram API
-        req = HTTPXRequest(read_timeout=30.0, connect_timeout=15.0)
+        # Configurable timeouts with reasonable defaults
+        telegram_read_timeout = float(os.getenv('TELEGRAM_READ_TIMEOUT', 30.0))
+        telegram_connect_timeout = float(os.getenv('TELEGRAM_CONNECT_TIMEOUT', 15.0))
+        req = HTTPXRequest(read_timeout=telegram_read_timeout, connect_timeout=telegram_connect_timeout)
         # Initialize LLM once at startup via PTB post_init
         async def _post_init(app):
             try:
@@ -66,8 +74,8 @@ class SimpleSportsBot:
         self._analysis_cache = {}
         # Track cache creation times for intelligent cleanup
         self._cache_timestamps = {}
-        # Maximum cache age (24 hours) - generous timeout
-        self._max_cache_age = 24 * 60 * 60  # 24 hours in seconds
+        # Maximum cache age - configurable timeout with 24 hours as default
+        self._max_cache_age = int(os.getenv('CACHE_MAX_AGE', 24 * 60 * 60))  # seconds
 
     async def ensure_api(self):
         if not self._api_ready:
@@ -118,6 +126,8 @@ class SimpleSportsBot:
     def setup_handlers(self) -> None:
         # Core
         self.application.add_handler(CommandHandler("start", self.start_command))
+        # Global error handler to prevent unhandled exceptions from bubbling up
+        self.application.add_error_handler(self.error_handler)
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("leagues", self.leagues_command))
         self.application.add_handler(CommandHandler("upcoming", self.upcoming_command))
@@ -128,6 +138,8 @@ class SimpleSportsBot:
         # Analysis/advanced
         self.application.add_handler(CommandHandler("analysis", self.analysis_command))
         self.application.add_handler(CommandHandler("advanced", self.advanced_prediction_command))
+        self.application.add_handler(CommandHandler("deepanalyze", self.deep_analyze_command))
+        self.application.add_handler(CommandHandler("degenanalyze", self.degen_analyze_command))
         self.application.add_handler(CommandHandler("live", self.live_command))
         self.application.add_handler(CommandHandler("accuracy", self.accuracy_command))
 
@@ -356,12 +368,13 @@ class SimpleSportsBot:
                         parse_mode='Markdown'
                     )
                     
-                    # Execute premium analysis with timeout
+                    
+                    # Execute premium analysis with configurable timeout
+                    premium_analysis_timeout = float(os.getenv('PREMIUM_ANALYSIS_TIMEOUT', 60.0))
                     premium_result = await asyncio.wait_for(
                         self.llm_predictor.predict_premium_analysis(home_team, away_team),
-                        timeout=60.0  # 60 second timeout for multi-prompt execution
+                        timeout=premium_analysis_timeout  # Configurable timeout for multi-prompt execution
                     )
-                    
                     if premium_result.get('error'):
                         # Premium analysis failed - show specific error
                         error_msg = premium_result.get('error', 'Unknown error')
@@ -544,9 +557,10 @@ class SimpleSportsBot:
                     try:
                         logger.info(f"Starting enhanced analysis for {home_team} vs {away_team}")
                         # Add timeout to prevent hanging when browser can't be launched
+                        browser_analysis_timeout = float(os.getenv('BROWSER_ANALYSIS_TIMEOUT', 30.0))
                         enhanced_result = await asyncio.wait_for(
                             self.browser_analysis.enhanced_analysis(user_id, home_team, away_team),
-                            timeout=30.0  # 30 second timeout
+                            timeout=browser_analysis_timeout  # Configurable timeout
                         )
                         logger.info(f"Enhanced analysis result: valid={enhanced_result.get('valid')}, sources={len(enhanced_result.get('data_sources', []))}")
                         
@@ -697,7 +711,7 @@ class SimpleSportsBot:
         
         # First pass: Handle markdown formatting issues that cause entity parsing errors
         # Remove incomplete markdown patterns
-        text = re.sub(r'\*{3,}', '**', text)  # Multiple asterisks -> double
+        text = re.sub(r'\*{3,}', '**', text) # Multiple asterisks -> double
         text = re.sub(r'_{3,}', '__', text)   # Multiple underscores -> double
         text = re.sub(r'`{2,}', '`', text)    # Multiple backticks -> single
         
@@ -1278,7 +1292,7 @@ class SimpleSportsBot:
         """
         Estimate shots on target.
         """
-        total_prob = home_win_prob + away_win_prob  # Excludes draw
+        total_prob = home_win_prob + away_win_prob # Excludes draw
         if total_prob > 140:  # High-scoring expectation
             return "12-18 shots (attacking match)"
         elif total_prob > 120:
@@ -1493,6 +1507,914 @@ class SimpleSportsBot:
             logger.error(f"Error in advanced_prediction_command: {e}")
             await update.message.reply_text("⚠️ Error running advanced prediction. Please try again.")
 
+    async def deep_analyze_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Deep analysis command that performs comprehensive research and analysis with enhanced error handling"""
+        # Validate user input
+        if not context.args:
+            await update.message.reply_text(
+                "🧠 *Deep Analysis*\n\n"
+                "Please provide a sports event to analyze.\n"
+                "Example: `/deepanalyze Manchester United vs Liverpool`\n\n"
+                "This command performs comprehensive research and analysis using multiple AI models.",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Parse and sanitize the event query
+        event_query = ' '.join(context.args).strip()
+        
+        # Validate event query
+        if not event_query or len(event_query) < 3:
+            await update.message.reply_text(
+                "❌ Invalid input. Please provide a valid sports event to analyze.\n"
+                "Example: `/deepanalyze Manchester United vs Liverpool`"
+            )
+            return
+        
+        # Check if query contains "vs" or "versus"
+        if "vs" not in event_query.lower() and "versus" not in event_query.lower():
+            await update.message.reply_text(
+                "❌ Invalid input format. Please use 'vs' or 'versus' between team names.\n"
+                "Example: `/deepanalyze Manchester United vs Liverpool`"
+            )
+            return
+        
+        # Sanitize team names to prevent injection attacks
+        sanitized_query = self._sanitize_team_names(event_query)
+        
+        # Initialize progress tracking
+        progress_message = await update.message.reply_text(
+            f"🧠 *Deep Analysis Initiated*\n\n"
+            f"Analyzing: {sanitized_query}\n\n"
+            f"🔄 Gathering initial data...\n\n"
+            f"Estimated time: 30-60 seconds",
+            parse_mode='Markdown'
+        )
+
+        try:
+            # Import required modules
+            from query_generator import generate_search_queries
+            from data_acquisition import acquire_data
+            from content_processor import process_content_with_flash
+            from final_analyzer import get_final_analysis_with_pro
+
+            # Runtime verification logs: which modules/flags are active
+            import inspect
+            try:
+                gen_src = inspect.getsourcefile(generate_search_queries)
+            except Exception:
+                gen_src = 'unknown'
+            try:
+                acq_src = inspect.getsourcefile(acquire_data)
+            except Exception:
+                acq_src = 'unknown'
+            flags = {
+                'USE_FLASH_QUERY_GENERATION': os.getenv('USE_FLASH_QUERY_GENERATION'),
+                'SERP_RERANKER_ENABLED': os.getenv('SERP_RERANKER_ENABLED'),
+                'GEMINI_API_KEY_set': bool(os.getenv('GEMINI_API_KEY')),
+                'GEMINI_MODEL_ID': os.getenv('GEMINI_MODEL_ID'),
+                'GEMINI_FLASH_MODEL_ID': os.getenv('GEMINI_FLASH_MODEL_ID'),
+            }
+            logger.info(f"DeepAnalyze flags: {flags}")
+            logger.info(f"generate_search_queries from: {gen_src}")
+            logger.info(f"acquire_data from: {acq_src}")
+
+            # Overall timeout for the entire deep analysis process - configurable
+            overall_timeout = float(os.getenv('DEEP_ANALYSIS_OVERALL_TIMEOUT', 90.0))
+
+            # Step 1: Generate search queries with timeout and enhanced error handling
+            max_query_retries = int(os.getenv('QUERY_GENERATION_MAX_RETRIES', 3))
+            for query_retry in range(max_query_retries):
+                try:
+                    await progress_message.edit_text(
+                        f"🔍 *Step 1/4*: Generating search queries (attempt {query_retry + 1}/{max_query_retries})...\n\n"
+                        f"Event: {sanitized_query}\n"
+                        f"⏳ Please wait...\n\n"
+                        f"Estimated time: 5-10 seconds",
+                        parse_mode='Markdown'
+                    )
+                    
+                    # Calculate adaptive timeout based on retry count
+                    query_generation_timeout = float(os.getenv('QUERY_GENERATION_TIMEOUT', 10.0))
+                    adaptive_timeout = self._calculate_adaptive_timeout(query_generation_timeout, query_retry, max_query_retries)
+                    queries = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(None, generate_search_queries, sanitized_query),
+                        timeout=adaptive_timeout
+                    )
+                    # Success, break out of retry loop
+                    break
+                except asyncio.TimeoutError:
+                    if query_retry < max_query_retries - 1:
+                        # Log retry attempt
+                        logger.warning(f"Query generation timeout (attempt {query_retry + 1}/{max_query_retries}), retrying with increased timeout...")
+                        # Wait a bit before retrying
+                        await asyncio.sleep(1.0 * (query_retry + 1))
+                        continue
+                    else:
+                        # All retries exhausted, re-raise the exception
+                        raise
+            
+            if not queries or len(queries) == 0:
+                await progress_message.edit_text(
+                    f"❌ *Query Generation Failed*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ No search queries could be generated for this event.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Check the event format (e.g., 'Team A vs Team B')\n"
+                    f"• Try a more specific team or player names\n"
+                    f"• Ensure the event is upcoming or recent"
+                )
+                return
+            
+            logger.info(f"Generated {len(queries)} search queries for '{sanitized_query}'")
+            
+            # Provide feedback on intermediate results
+            await progress_message.edit_text(
+                f"🔍 *Step 1/4*: Generating search queries...\n\n"
+                f"Event: {sanitized_query}\n"
+                f"✅ Generated {len(queries)} search queries\n\n"
+                f"Estimated time: 5-10 seconds",
+                parse_mode='Markdown'
+            )
+            
+        except asyncio.TimeoutError:
+            await progress_message.edit_text(
+                f"⏱️ *Query Generation Timeout*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ The query generation process took too long.\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a more specific event format\n"
+                f"• Check your internet connection"
+            )
+            logger.error(f"Query generation timeout for event: {sanitized_query}")
+            return
+        except ValueError as e:
+            # Handle specific ValueError from query generator
+            await progress_message.edit_text(
+                f"❌ *Query Generation Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Invalid input for query generation: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Check the event format (e.g., 'Team A vs Team B')\n"
+                f"• Ensure team names are properly formatted"
+            )
+            logger.error(f"Query generation ValueError for event '{sanitized_query}': {e}")
+            return
+        except Exception as e:
+            await progress_message.edit_text(
+                f"❌ *Query Generation Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Failed to generate search queries: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Check the event format (e.g., 'Team A vs Team B')\n"
+                f"• Try a different event\n"
+                f"• Contact support if the issue persists"
+            )
+            logger.error(f"Query generation error for event '{sanitized_query}': {e}")
+            return
+
+        # Step 2: Acquire data with timeout and enhanced error handling
+        max_data_retries = int(os.getenv('DATA_ACQUISITION_MAX_RETRIES', 3))
+        articles = None
+        for data_retry in range(max_data_retries):
+            try:
+                await progress_message.edit_text(
+                    f"🌐 *Step 2/4*: Acquiring data from sources (attempt {data_retry + 1}/{max_data_retries})...\n\n"
+                    f"Event: {sanitized_query}\n"
+                    f"🔍 Queries: {len(queries)}\n"
+                    f"⏳ Please wait (this may take 15-30 seconds)...\n\n"
+                    f"Estimated time remaining: 15-30 seconds",
+                    parse_mode='Markdown'
+                )
+                
+                # Calculate adaptive timeout based on retry count
+                data_acquisition_timeout = float(os.getenv('DATA_ACQUISITION_TIMEOUT', 30.0))
+                adaptive_timeout = self._calculate_adaptive_timeout(data_acquisition_timeout, data_retry, max_data_retries)
+                articles = await asyncio.wait_for(
+                    acquire_data(queries),
+                    timeout=adaptive_timeout
+                )
+                # Success, break out of retry loop
+                break
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                if data_retry < max_data_retries - 1:
+                    # Log retry attempt
+                    logger.warning(f"Data acquisition timeout/cancel (attempt {data_retry + 1}/{max_data_retries}), retrying with increased timeout...")
+                    # Wait a bit before retrying
+                    await asyncio.sleep(2.0 * (data_retry + 1))
+                    continue
+                else:
+                    # All retries exhausted, handle gracefully
+                    await progress_message.edit_text(
+                        f"⏱️ *Data Acquisition Timeout*\n\n"
+                        f"Event: {sanitized_query}\n\n"
+                        f"⚠️ Collecting articles took too long.\n\n"
+                        f"💡 *Suggestions:*\n"
+                        f"• Try again in a few minutes\n"
+                        f"• Check your internet connection\n"
+                        f"• Try a more specific or recent event",
+                        parse_mode='Markdown'
+                    )
+                    logger.error(f"Data acquisition timeout for event: {sanitized_query}")
+                    return
+            except aiohttp.ClientError as e:
+                await progress_message.edit_text(
+                    f"🌐 *Network Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Network connectivity issues occurred: {str(e)}\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Check your internet connection\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Restart your network connection",
+                    parse_mode='Markdown'
+                )
+                logger.error(f"Network error during data acquisition for event '{sanitized_query}': {e}")
+                return
+            except Exception as e:
+                error_msg = str(e)
+                if "403" in error_msg:
+                    await progress_message.edit_text(
+                        f"🚦 *Access Forbidden*\n\n"
+                        f"Event: {sanitized_query}\n\n"
+                        f"⚠️ Search service denied access (403 error).\n\n"
+                        f"💡 *Suggestions:*\n"
+                        f"• Try again in a few minutes\n"
+                        f"• Use a different event\n"
+                        f"• Check if the search service is working",
+                        parse_mode='Markdown'
+                    )
+                elif "429" in error_msg or "rate limit" in error_msg.lower():
+                    await progress_message.edit_text(
+                        f"🚦 *Rate Limit Exceeded*\n\n"
+                        f"Event: {sanitized_query}\n\n"
+                        f"⚠️ Search service is temporarily unavailable due to rate limits.\n\n"
+                        f"💡 *Suggestions:*\n"
+                        f"• Try again in a few minutes\n"
+                        f"• Use a different event\n"
+                        f"• Check back later when limits reset",
+                        parse_mode='Markdown'
+                    )
+                elif "network" in error_msg.lower() or "connection" in error_msg.lower():
+                    await progress_message.edit_text(
+                        f"🌐 *Network Error*\n\n"
+                        f"Event: {sanitized_query}\n\n"
+                        f"⚠️ Network connectivity issues occurred.\n\n"
+                        f"💡 *Suggestions:*\n"
+                        f"• Check your internet connection\n"
+                        f"• Try again in a few minutes\n"
+                        f"• Restart your network connection",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await progress_message.edit_text(
+                        f"❌ *Data Acquisition Error*\n\n"
+                        f"Event: {sanitized_query}\n\n"
+                        f"⚠️ Failed to acquire data from sources: {str(e)}\n\n"
+                        f"💡 *Suggestions:*\n"
+                        f"• Try again in a few minutes\n"
+                        f"• Use a different event\n"
+                        f"• Contact support if the issue persists",
+                        parse_mode='Markdown'
+                    )
+                logger.error(f"Data acquisition error for event '{sanitized_query}': {e}")
+                return
+        
+        if not articles or len(articles) == 0:
+            await progress_message.edit_text(
+                f"❌ *Data Acquisition Failed*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ No relevant data found for this event.\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try a more popular or recent event\n"
+                f"• Check if the teams/players are correctly named\n"
+                f"• Try again later when more data is available"
+            )
+            return
+        
+        logger.info(f"Acquired {len(articles)} articles for '{sanitized_query}'")
+        
+        # Provide feedback on intermediate results
+        await progress_message.edit_text(
+            f"🌐 *Step 2/4*: Acquiring data from sources...\n\n"
+            f"Event: {sanitized_query}\n"
+            f"🔍 Queries: {len(queries)}\n"
+            f"📄 Articles found: {len(articles)}\n\n"
+            f"Estimated time remaining: 10-20 seconds",
+            parse_mode='Markdown'
+        )
+
+        # Step 3: Process content with Flash with timeout and error handling
+        max_content_retries = int(os.getenv('CONTENT_PROCESSING_MAX_RETRIES', 3))
+        for content_retry in range(max_content_retries):
+            try:
+                await progress_message.edit_text(
+                    f"⚡ *Step 3/4*: Processing content with Gemini Flash (attempt {content_retry + 1}/{max_content_retries})...\n\n"
+                    f"Event: {sanitized_query}\n"
+                    f"📄 Articles: {len(articles)}\n"
+                    f"⏳ Please wait (this may take 10-20 seconds)...",
+                    parse_mode='Markdown'
+                )
+                
+                # Extract team names for content processing
+                team_parts = sanitized_query.split(" vs ")
+                if len(team_parts) < 2:
+                    team_parts = sanitized_query.split(" versus ")
+                if len(team_parts) < 2:
+                    # Fallback to splitting by common delimiters
+                    for delimiter in ["-", "–", "&", "and", "@"]:
+                        team_parts = sanitized_query.split(delimiter)
+                        if len(team_parts) >= 2:
+                            break
+                if len(team_parts) < 2:
+                    team_parts = [sanitized_query, "opponent"]
+                
+                # Calculate adaptive timeout based on retry count
+                content_processing_timeout = float(os.getenv('CONTENT_PROCESSING_TIMEOUT', 20.0))
+                adaptive_timeout = self._calculate_adaptive_timeout(content_processing_timeout, content_retry, max_content_retries)
+                processed_data = await asyncio.wait_for(
+                    process_content_with_flash(articles, team_parts),
+                    timeout=adaptive_timeout
+                )
+                # Success, break out of retry loop
+                break
+            except asyncio.TimeoutError:
+                if content_retry < max_content_retries - 1:
+                    # Log retry attempt
+                    logger.warning(f"Content processing timeout (attempt {content_retry + 1}/{max_content_retries}), retrying with increased timeout...")
+                    # Wait a bit before retrying
+                    await asyncio.sleep(1.5 * (content_retry + 1))
+                    continue
+                else:
+                    # All retries exhausted, re-raise the exception
+                    raise
+        
+        logger.info(f"Processed {len(processed_data)} relevant articles for '{sanitized_query}'")
+        
+        if not processed_data or len(processed_data) == 0:
+            await progress_message.edit_text(
+                f"❌ *Content Processing Failed*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ No relevant information could be extracted from sources.\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try a more popular or recent event\n"
+                f"• Check if the teams/players are correctly named\n"
+                f"• Try again later when more data is available"
+            )
+            return
+            
+        try:
+            pass  # This is a placeholder to maintain the try/except structure
+        except asyncio.TimeoutError:
+            await progress_message.edit_text(
+                f"⏱️ *Content Processing Timeout*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Content processing took too long.\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Try an event with less complex data"
+            )
+            logger.error(f"Content processing timeout for event: {sanitized_query}")
+            return
+        except json.JSONDecodeError as e:
+            # Handle JSON parsing errors specifically
+            await progress_message.edit_text(
+                f"❌ *Content Processing Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Invalid response format from AI model: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Contact support if the issue persists"
+            )
+            logger.error(f"JSON parsing error during content processing for event '{sanitized_query}': {e}")
+            return
+        except aiohttp.ClientError as e:
+            # Handle network-related errors from aiohttp
+            await progress_message.edit_text(
+                f"🌐 *Network Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Network connectivity issues occurred: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Check your internet connection\n"
+                f"• Try again in a few minutes\n"
+                f"• Restart your network connection"
+            )
+            logger.error(f"Network error during content processing for event '{sanitized_query}': {e}")
+            return
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                # Extract retry delay if available
+                retry_delay = self._extract_retry_delay(error_msg)
+                retry_msg = f" (retry in {retry_delay} seconds)" if retry_delay else ""
+                
+                await progress_message.edit_text(
+                    f"🚦 *Gemini API Rate Limit{retry_msg}*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Gemini Flash model is temporarily unavailable due to rate limits.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again later when limits reset\n"
+                    f"• Use a different event\n"
+                    f"• Check your API quota at https://aistudio.google.com/"
+                )
+            elif "invalid json" in error_msg.lower() or "json" in error_msg.lower():
+                await progress_message.edit_text(
+                    f"❌ *Content Processing Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Invalid response format from AI model.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Use a different event\n"
+                    f"• Contact support if the issue persists"
+                )
+            else:
+                await progress_message.edit_text(
+                    f"❌ *Content Processing Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Failed to process content with AI model: {str(e)}\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Use a different event\n"
+                    f"• Contact support if the issue persists"
+                )
+            logger.error(f"Content processing error for event '{sanitized_query}': {e}")
+            return
+
+        # Validate processed data before final analysis
+        if not self._validate_processed_data(processed_data):
+            await progress_message.edit_text(
+                f"❌ *Data Validation Failed*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Processed data failed validation checks.\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try a different event\n"
+                f"• Check if sufficient data was collected\n"
+                f"• Try again later"
+            )
+            logger.warning(f"Processed data validation failed for event: {sanitized_query}")
+            return
+        
+        # Step 4: Get final analysis with Pro with timeout and error handling
+        max_final_retries = int(os.getenv('FINAL_ANALYSIS_MAX_RETRIES', 3))
+        for final_retry in range(max_final_retries):
+            try:
+                await progress_message.edit_text(
+                    f"🤖 *Step 4/4*: Generating final analysis with Gemini Pro (attempt {final_retry + 1}/{max_final_retries})...\n\n"
+                    f"Event: {sanitized_query}\n"
+                    f"📊 Processed Data: {len(processed_data)} items\n"
+                    f"⏳ Please wait (this may take 10-20 seconds)...",
+                    parse_mode='Markdown'
+                )
+                
+                # Calculate adaptive timeout based on retry count
+                final_analysis_timeout = float(os.getenv('FINAL_ANALYSIS_TIMEOUT', 20.0))
+                adaptive_timeout = self._calculate_adaptive_timeout(final_analysis_timeout, final_retry, max_final_retries)
+                final_analysis = await asyncio.wait_for(
+                    get_final_analysis_with_pro(processed_data, sanitized_query),
+                    timeout=adaptive_timeout
+                )
+                # Success, break out of retry loop
+                break
+            except asyncio.TimeoutError:
+                if final_retry < max_final_retries - 1:
+                    # Log retry attempt
+                    logger.warning(f"Final analysis timeout (attempt {final_retry + 1}/{max_final_retries}), retrying with increased timeout...")
+                    # Wait a bit before retrying
+                    await asyncio.sleep(1.5 * (final_retry + 1))
+                    continue
+                else:
+                    # All retries exhausted, re-raise the exception
+                    raise
+        
+        # Send the final report with safe Markdown handling
+        final_report = (
+            f"📊 *Deep Analysis Complete*\n\n"
+            f"Event: {sanitized_query}\n\n"
+            f"{final_analysis}"
+        )
+        try:
+            await progress_message.edit_text(final_report, parse_mode='Markdown')
+        except BadRequest:
+            try:
+                sanitized_report = self._sanitize_telegram_text(final_report)
+                await progress_message.edit_text(sanitized_report, parse_mode='Markdown')
+            except BadRequest:
+                # Fallback to plain text if Markdown still fails
+                plain = final_report.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
+                await progress_message.edit_text(plain)
+        
+        try:
+            pass  # This is a placeholder to maintain the try/except structure
+        except asyncio.TimeoutError:
+            await progress_message.edit_text(
+                f"⏱️ *Final Analysis Timeout*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Final analysis took too long.\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Try an event with less complex data"
+            )
+            logger.error(f"Final analysis timeout for event: {sanitized_query}")
+            return
+        except json.JSONDecodeError as e:
+            # Handle JSON parsing errors specifically
+            await progress_message.edit_text(
+                f"❌ *Final Analysis Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Invalid response format from AI model: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Contact support if the issue persists"
+            )
+            logger.error(f"JSON parsing error during final analysis for event '{sanitized_query}': {e}")
+            return
+        except aiohttp.ClientError as e:
+            # Handle network-related errors from aiohttp
+            await progress_message.edit_text(
+                f"🌐 *Network Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Network connectivity issues occurred: {str(e)}\n"
+                f"💡 *Suggestions:*\n"
+                f"• Check your internet connection\n"
+                f"• Try again in a few minutes\n"
+                f"• Restart your network connection"
+            )
+            logger.error(f"Network error during final analysis for event '{sanitized_query}': {e}")
+            return
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                # Extract retry delay if available
+                retry_delay = self._extract_retry_delay(error_msg)
+                retry_msg = f" (retry in {retry_delay} seconds)" if retry_delay else ""
+                
+                await progress_message.edit_text(
+                    f"🚦 *Gemini API Rate Limit{retry_msg}*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Gemini Pro model is temporarily unavailable due to rate limits.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again later when limits reset\n"
+                    f"• Use a different event\n"
+                    f"• Check your API quota at https://aistudio.google.com/"
+                )
+            elif "invalid json" in error_msg.lower() or "json" in error_msg.lower():
+                await progress_message.edit_text(
+                    f"❌ *Final Analysis Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Invalid response format from AI model.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Use a different event\n"
+                    f"• Contact support if the issue persists"
+                )
+            else:
+                await progress_message.edit_text(
+                    f"❌ *Final Analysis Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Failed to generate final analysis: {str(e)}\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Use a different event\n"
+                    f"• Contact support if the issue persists"
+                )
+            logger.error(f"Final analysis error for event '{sanitized_query}': {e}")
+            return
+            
+        try:
+            pass  # This is a placeholder to maintain the try/except structure
+        except asyncio.TimeoutError:
+            await progress_message.edit_text(
+                f"⏱️ *Overall Process Timeout*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ The entire analysis process took too long (>{overall_timeout} seconds).\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Check your internet connection"
+            )
+            logger.error(f"Overall process timeout for event: {sanitized_query}")
+        except json.JSONDecodeError as e:
+            # Handle JSON parsing errors specifically
+            await progress_message.edit_text(
+                f"❌ *Data Processing Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Invalid response format from AI model: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Contact support if the issue persists"
+            )
+            logger.error(f"JSON parsing error in deep_analyze_command for event '{sanitized_query}': {e}")
+        except aiohttp.ClientError as e:
+            # Handle network-related errors from aiohttp
+            await progress_message.edit_text(
+                f"🌐 *Network Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Network connectivity issues occurred: {str(e)}\n"
+                f"💡 *Suggestions:*\n"
+                f"• Check your internet connection\n"
+                f"• Try again in a few minutes\n"
+                f"• Restart your network connection"
+            )
+            logger.error(f"Network error in deep_analyze_command for event '{sanitized_query}': {e}")
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                # Extract retry delay if available
+                retry_delay = self._extract_retry_delay(error_msg)
+                retry_msg = f" (retry in {retry_delay} seconds)" if retry_delay else ""
+                
+                await progress_message.edit_text(
+                    f"🚦 *API Rate Limit{retry_msg}*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ API is temporarily unavailable due to rate limits.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again later when limits reset\n"
+                    f"• Use a different event\n"
+                    f"• Check your API quota"
+                )
+            elif "403" in error_msg:
+                await progress_message.edit_text(
+                    f"🔐 *Access Forbidden*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Access to the service was denied (403 error).\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Check your API key\n"
+                    f"• Verify your account permissions\n"
+                    f"• Contact support if the issue persists"
+                )
+            elif "invalid json" in error_msg.lower() or "json" in error_msg.lower():
+                await progress_message.edit_text(
+                    f"❌ *Data Processing Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ Invalid response format from service.\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Use a different event\n"
+                    f"• Contact support if the issue persists"
+                )
+            else:
+                logger.error(f"Unexpected error in deep_analyze_command for event '{sanitized_query}': {e}")
+                await progress_message.edit_text(
+                    f"❌ *Unexpected Error*\n\n"
+                    f"Event: {sanitized_query}\n\n"
+                    f"⚠️ An unexpected error occurred during analysis: {str(e)}\n\n"
+                    f"💡 *Suggestions:*\n"
+                    f"• Try again in a few minutes\n"
+                    f"• Use a different event\n"
+                    f"• Contact support with error details"
+                )
+
+    async def degen_analyze_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Degen analysis command that performs real-time research and analysis with degen tone"""
+        # Check if the feature is enabled
+        if os.getenv("USE_FLASH_LIVE", "0") != "1":
+            await update.message.reply_text(
+                "❌ *Degen Analysis Disabled*\n\n"
+                "The /degenanalyze feature is currently disabled.\n"
+                "Set USE_FLASH_LIVE=1 in your environment to enable it.",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Validate user input
+        if not context.args:
+            await update.message.reply_text(
+                "🧠 *Degen Analysis*\n\n"
+                "Please provide a sports event to analyze.\n"
+                "Example: `/degenanalyze Manchester United vs Liverpool`\n\n"
+                "This command performs real-time research and analysis with degen tone.",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Parse and sanitize the event query
+        event_query = ' '.join(context.args).strip()
+        
+        # Validate event query
+        if not event_query or len(event_query) < 3:
+            await update.message.reply_text(
+                "❌ Invalid input. Please provide a valid sports event to analyze.\n"
+                "Example: `/degenanalyze Manchester United vs Liverpool`"
+            )
+            return
+        
+        # Check if query contains "vs" or "versus"
+        if "vs" not in event_query.lower() and "versus" not in event_query.lower():
+            await update.message.reply_text(
+                "❌ Invalid input format. Please use 'vs' or 'versus' between team names.\n"
+                "Example: `/degenanalyze Manchester United vs Liverpool`"
+            )
+            return
+        
+        # Sanitize team names to prevent injection attacks
+        sanitized_query = self._sanitize_team_names(event_query)
+        
+        # Initialize progress tracking
+        progress_message = await update.message.reply_text(
+            f"🧠 *Degen Analysis Initiated*\n\n"
+            f"Analyzing: {sanitized_query}\n\n"
+            f"🔄 Gathering initial data...\n\n"
+            f"Estimated time: 30-60 seconds",
+            parse_mode='Markdown'
+        )
+
+        # Initialize session variables
+        live_session = None
+        try:
+            # Create and initialize a LiveSession
+            live_session = LiveSession(sanitized_query)
+            
+            # Start the live session
+            await live_session.start_session()
+            
+            # Post initial degen-toned message
+            await progress_message.edit_text(
+                f"🔥 *Degen Analysis Started*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"📡 Scanning the interwebs for spicy degen insights...\n"
+                f"📈 Real-time updates coming your way!\n\n"
+                f"Estimated time: 30-60 seconds",
+                parse_mode='Markdown'
+            )
+            
+            # Handle streaming updates with safe-edit fallback
+            session_end_message = None
+            while live_session.is_streaming:
+                try:
+                    # Wait for updates with a timeout
+                    update_data = await asyncio.wait_for(live_session.stream_queue.get(), timeout=1.0)
+                    
+                    # Check if this is a session end message
+                    if update_data.get("type") == "session_end":
+                        session_end_message = update_data.get("message", "Research session completed")
+                        break
+                    
+                    # Format the update using the stream renderer
+                    formatted_update = update_data.get("message", "New update received")
+                    
+                    # Send the update to the user
+                    try:
+                        await progress_message.edit_text(formatted_update, parse_mode='Markdown')
+                    except BadRequest as e:
+                        # If Markdown fails, try with sanitized text
+                        sanitized_update = self._sanitize_telegram_text(formatted_update)
+                        await progress_message.edit_text(sanitized_update, parse_mode='Markdown')
+                    except Exception:
+                        # If all else fails, send as plain text
+                        plain_text = formatted_update.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
+                        await progress_message.edit_text(plain_text)
+                
+                except asyncio.TimeoutError:
+                    # Continue the loop to check if streaming is still active
+                    continue
+                except Exception as e:
+                    logger.error(f"Error handling streaming update: {e}")
+                    # Continue processing other updates
+                    continue
+            
+            # Generate and display the final degen-toned report
+            final_report = live_session.generate_final_report()
+            
+            try:
+                await progress_message.edit_text(final_report, parse_mode='Markdown')
+            except BadRequest as e:
+                # If Markdown fails, try with sanitized text
+                sanitized_report = self._sanitize_telegram_text(final_report)
+                await progress_message.edit_text(sanitized_report, parse_mode='Markdown')
+            except Exception:
+                # If all else fails, send as plain text
+                plain_text = final_report.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
+                await progress_message.edit_text(plain_text)
+            
+        except Exception as e:
+            logger.error(f"Error in degen_analyze_command: {e}")
+            # Send error message to user
+            error_message = (
+                f"❌ *Degen Analysis Error*\n\n"
+                f"Event: {sanitized_query}\n\n"
+                f"⚠️ Failed to perform degen analysis: {str(e)}\n\n"
+                f"💡 *Suggestions:*\n"
+                f"• Try again in a few minutes\n"
+                f"• Use a different event\n"
+                f"• Contact support if the issue persists"
+            )
+            try:
+                await progress_message.edit_text(error_message, parse_mode='Markdown')
+            except Exception:
+                # If we can't edit the message, try to send a new one
+                try:
+                    await update.message.reply_text(error_message, parse_mode='Markdown')
+                except Exception:
+                    # Last resort: send a simple text message
+                    await update.message.reply_text(f"Error: {str(e)}")
+        finally:
+            # Stop the session if it was created
+            try:
+                if live_session:
+                    await live_session.stop_session()
+            except Exception as stop_error:
+                logger.error(f"Error stopping live session: {stop_error}")
+
+    def _sanitize_team_names(self, query: str) -> str:
+        """
+        Sanitize team names to prevent injection attacks and handle malformed input.
+        
+        Args:
+            query (str): The user-provided query
+            
+        Returns:
+            str: Sanitized query
+        """
+        import re
+        
+        # Remove potentially dangerous characters
+        sanitized = re.sub(r'[<>"\'&;`]', '', query)
+        
+        # Normalize whitespace
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        
+        # Fix common formatting issues with "vs"
+        sanitized = re.sub(r'\s*vs[.\s]*vs\s*', ' vs ', sanitized, flags=re.IGNORECASE)
+        sanitized = re.sub(r'^vs\s+', '', sanitized, flags=re.IGNORECASE)
+        
+        return sanitized
+    
+    def _extract_retry_delay(self, error_msg: str) -> Optional[int]:
+        """
+        Extract retry delay from error message if available.
+        
+        Args:
+            error_msg (str): Error message string
+            
+        Returns:
+            Optional[int]: Retry delay in seconds or None if not found
+        """
+        import re
+        
+        # Look for retry_delay in the error message
+        match = re.search(r'retry_delay.*?seconds:\s*(\d+)', error_msg)
+        if match:
+            return int(match.group(1))
+        return None
+    
+    def _validate_processed_data(self, processed_data: List[Dict]) -> bool:
+        """
+        Validate processed data before sending to final analysis.
+        
+        Args:
+            processed_data (List[Dict]): Processed data from content processor
+            
+        Returns:
+            bool: True if data is valid, False otherwise
+        """
+        # Check if we have any data
+        if not processed_data or len(processed_data) == 0:
+            return False
+        
+        # Check if we have at least some relevant data
+        relevant_items = 0
+        for item in processed_data:
+            # Check for key fields that indicate relevant data
+            if (item.get('summary') and len(str(item['summary']).strip()) > 10) or \
+               (item.get('key_players_mentioned') and len(item['key_players_mentioned']) > 0) or \
+               (item.get('injuries_or_suspensions') and len(item['injuries_or_suspensions']) > 0):
+                relevant_items += 1
+        
+        # Require at least 1 relevant item
+        return relevant_items >= 1
+    
+    def _calculate_adaptive_timeout(self, base_timeout: float, retry_count: int, max_retries: int = 3) -> float:
+        """
+        Calculate adaptive timeout based on retry count.
+        
+        Args:
+            base_timeout (float): Base timeout value
+            retry_count (int): Current retry attempt (0 for first attempt)
+            max_retries (int): Maximum number of retries allowed
+            
+        Returns:
+            float: Adaptive timeout value
+        """
+        # Increase timeout by 50% for each retry, up to double the original timeout
+        timeout_multiplier = 1.0 + (0.5 * retry_count)
+        # Cap the multiplier to prevent excessive timeouts
+        max_multiplier = min(2.0, 1.0 + (0.5 * max_retries))
+        timeout_multiplier = min(timeout_multiplier, max_multiplier)
+        return base_timeout * timeout_multiplier
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global error handler to avoid unhandled exception logs from PTB."""
+        try:
+            logger.error("Unhandled exception in handler", exc_info=context.error)
+        except Exception:
+            # As a last resort, ensure we don't raise from the error handler itself
+            logger.exception("Error within error_handler")
+
     # ----- Buttons -----
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -1637,7 +2559,7 @@ class SimpleSportsBot:
                         f"• Analysis sessions are cleaned up automatically\n\n"
                         f"💡 **Quick Recovery:**\n"
                         f"• Generate fresh analysis (recommended)\n"
-                        f"• Get latest data and insights\n\n"
+                        f"• Get latest data and insights\n"
                         f"*🆕 New analysis includes most recent team data*",
                         parse_mode='Markdown',
                         reply_markup=InlineKeyboardMarkup(regenerate_keyboard)
@@ -1702,7 +2624,7 @@ class SimpleSportsBot:
                         if self.llm_predictor and self.llm_predictor._client_ready:
                             premium_result = await asyncio.wait_for(
                                 self.llm_predictor.predict_premium_analysis(home_team, away_team),
-                                timeout=60.0
+                                timeout=float(os.getenv('PREMIUM_ANALYSIS_TIMEOUT', 60.0))
                             )
                             
                             if not premium_result.get('error'):
@@ -2074,7 +2996,7 @@ class SimpleSportsBot:
             [InlineKeyboardButton("🇪🇺 Europe", callback_data="region_europe"), 
              InlineKeyboardButton("🇺🇸 North America", callback_data="region_north_america")],
             [InlineKeyboardButton("🇧🇷 South America", callback_data="region_south_america"), 
-             InlineKeyboardButton("🇫🇫 Asia", callback_data="region_asia")],
+             InlineKeyboardButton("🇫 Asia", callback_data="region_asia")],
             [InlineKeyboardButton("🌍 All Popular Leagues", callback_data="region_all_popular")],
             [InlineKeyboardButton("📅 Direct to Upcoming", callback_data="upcoming")]
         ]
@@ -2324,24 +3246,6 @@ class SimpleSportsBot:
             ]
             
             return text, keyboard
-        await query.edit_message_text("⏳ Getting upcoming matches...")
-        try:
-            await self.ensure_provider()
-            matches = await self.provider.get_upcoming_matches(max_total=10)
-            if matches:
-                txt = "📅 *Upcoming Matches*\n\n⚽ *Football Matches from Multiple Leagues*\n"
-                for m in matches[:9]:
-                    match_time = m.match_time or 'TBD'
-                    league = m.league_name or 'League'
-                    txt += f"  • {m.home_team} vs {m.away_team}\n"
-                    txt += f"    🏆 {league} • ⏰ {match_time}\n\n"
-                txt += f"\n*Total: {len(matches)} matches found*\nData from TheSportsDB ✅"
-            else:
-                txt = "📅 *Upcoming Matches*\n\n⚠️ No upcoming matches found at the moment."
-            keyboard = [[InlineKeyboardButton("🎯 Get Predictions", callback_data="predict"), InlineKeyboardButton("🔄 Refresh", callback_data="upcoming")]]
-            await query.edit_message_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception:
-            await query.edit_message_text("⚠️ Error getting matches.")
 
     async def send_upcoming_response(self, query):
         """Enhanced upcoming response with multi-step navigation"""
@@ -2562,7 +3466,7 @@ Live odds API not configured. Showing heuristic-based odds:
             'market_probabilities': {'home_win': home_prob, 'draw': draw_prob, 'away_win': away_prob},
             'raw_odds': {
                 'home': 1 / (home_prob / 100) if home_prob > 0 else 10.0,
-                'draw': 1 / (draw_prob / 100) if draw_prob > 0 else 10.0,
+                'draw': 1 / (draw_prob / 10) if draw_prob > 0 else 10.0,
                 'away': 1 / (away_prob / 100) if away_prob > 0 else 10.0,
             },
             'market_confidence': 0.75,

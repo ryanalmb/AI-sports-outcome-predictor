@@ -1,6 +1,6 @@
 # Setup and run Sports Prediction Bot (Windows PowerShell)
 # - Creates a Python 3.12 venv
-# - Installs required packages
+# - Installs required packages from pyproject.toml
 # - Copies .env.example to .env (if missing)
 # - Loads .env into process environment
 # - Runs the bot
@@ -31,12 +31,12 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
 Write-Host "[3/7] Activating virtual environment..." -ForegroundColor Cyan
 & .\.venv\Scripts\Activate.ps1
 
-Write-Host "[4/7] Installing Python dependencies..." -ForegroundColor Cyan
+Write-Host "[4/7] Installing Python dependencies from pyproject.toml..." -ForegroundColor Cyan
 python -m pip install -U pip
 # Remove conflicting package if present
 python -m pip uninstall -y telegram | Out-Null
-# Install required deps
-python -m pip install "python-telegram-bot==20.7" aiohttp requests numpy pandas scikit-learn google-generativeai
+# Install all required dependencies from pyproject.toml
+python -m pip install -e .
 
 Write-Host "[5/7] Preparing .env file..." -ForegroundColor Cyan
 if (-not (Test-Path ".env")) {
